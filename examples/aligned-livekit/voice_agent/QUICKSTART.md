@@ -4,10 +4,23 @@ This guide helps you build and flash the LiveKit-based voice firmware to your Se
 
 ## Prerequisites
 
-1. **ESP-IDF v5.4+** installed at `~/esp/esp-idf-v5.4.3`
-2. **Watcher device** connected via USB
-3. **Aligned backend** running (locally or production)
-4. **Device token** from `/api/py/watcher/device/register`
+1. **ESP-IDF v5.4.3** installed at `~/esp/esp-idf-v5.4.3` — see install
+   instructions in `aligned-tools/.claude/rules/hardware.md` (the parent
+   repo). Or briefly:
+   ```bash
+   mkdir -p ~/esp && cd ~/esp
+   git clone -b v5.4.3 --recursive https://github.com/espressif/esp-idf.git esp-idf-v5.4.3
+   cd esp-idf-v5.4.3 && ./install.sh esp32s3
+   ```
+2. **esptool 5.2.0+** for the incremental fast-flash path:
+   ```bash
+   brew install python && pip3 install --upgrade 'esptool>=5.2.0'
+   /opt/homebrew/bin/esptool version   # expect 5.2.0 or newer
+   ```
+3. **Watcher device** connected via USB — verify with
+   `ls /dev/cu.usbmodem*` (should show two ports ending in `01` and `03`).
+4. **Aligned backend** running (locally or production), and a
+   **device token** from `/api/py/watcher/device/register`.
 
 ## Step 1: Configure WiFi
 
