@@ -12,19 +12,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "driver/i2c.h"
-
+#include "driver/gpio.h"
+#include "driver/i2c.h" // Legacy Driver
+#include "esp_intr_alloc.h"
 #include "esp_bit_defs.h"
 #include "esp_timer.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "esp_io_expander.h"
 
 /* Timeout of each I2C communication */
-#define I2C_TIMEOUT_MS (30)
+#define I2C_TIMEOUT_MS (100)
 /* Re-try times when I2C communication failed */
-#define I2C_TRY_NUM (3)
+#define I2C_TRY_NUM (10)
 
 #define IO_COUNT (16)
 
@@ -84,7 +87,8 @@ static void io_exp_isr_handler(void *arg)
 
 esp_err_t esp_io_expander_new_i2c_pca95xx_16bit(i2c_port_t i2c_num, uint32_t i2c_address, esp_io_expander_handle_t *handle)
 {
-    ESP_RETURN_ON_FALSE(i2c_num < I2C_NUM_MAX, ESP_ERR_INVALID_ARG, TAG, "Invalid i2c num");
+    // Legacy: i2c_num checks
+    ESP_RETURN_ON_FALSE(i2c_num >= 0, ESP_ERR_INVALID_ARG, TAG, "Invalid i2c num");
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
 
     esp_io_expander_pca95xx_16bit_t *pca = (esp_io_expander_pca95xx_16bit_t *)calloc(1, sizeof(esp_io_expander_pca95xx_16bit_t));
@@ -95,10 +99,14 @@ esp_err_t esp_io_expander_new_i2c_pca95xx_16bit(i2c_port_t i2c_num, uint32_t i2c
     pca->int_gpio = -1;
     pca->need_update = true;
 
+    esp_err_t ret = ESP_OK;
+
     pca->base.config.io_count = IO_COUNT;
     pca->base.config.flags.dir_out_bit_zero = 1;
+
     pca->i2c_num = i2c_num;
     pca->i2c_address = i2c_address;
+
     pca->base.read_input_reg = read_input_reg;
     pca->base.write_output_reg = write_output_reg;
     pca->base.read_output_reg = read_output_reg;
@@ -107,7 +115,6 @@ esp_err_t esp_io_expander_new_i2c_pca95xx_16bit(i2c_port_t i2c_num, uint32_t i2c
     pca->base.del = del;
     pca->base.reset = reset;
 
-    esp_err_t ret = ESP_OK;
     /* Reset configuration and register status */
     ESP_GOTO_ON_ERROR(reset(&pca->base), err, TAG, "Reset failed");
 
@@ -115,12 +122,12 @@ esp_err_t esp_io_expander_new_i2c_pca95xx_16bit(i2c_port_t i2c_num, uint32_t i2c
     return ESP_OK;
 err:
     free(pca);
-    return ret;
+    return ESP_FAIL;
 }
 
 esp_err_t esp_io_expander_new_i2c_pca95xx_16bit_ex(i2c_port_t i2c_num, uint32_t i2c_address, const pca95xx_16bit_ex_config_t *config, esp_io_expander_handle_t *handle)
 {
-    ESP_RETURN_ON_FALSE(i2c_num < I2C_NUM_MAX, ESP_ERR_INVALID_ARG, TAG, "Invalid i2c num");
+    ESP_RETURN_ON_FALSE(i2c_num >= 0, ESP_ERR_INVALID_ARG, TAG, "Invalid i2c num");
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
 
     esp_io_expander_pca95xx_16bit_t *pca = (esp_io_expander_pca95xx_16bit_t *)calloc(1, sizeof(esp_io_expander_pca95xx_16bit_t));
@@ -130,6 +137,8 @@ esp_err_t esp_io_expander_new_i2c_pca95xx_16bit_ex(i2c_port_t i2c_num, uint32_t 
     pca->isr_cb = config->isr_cb;
     pca->user_ctx = config->user_ctx;
     pca->need_update = true;
+
+    esp_err_t ret = ESP_OK;
 
     if (pca->int_gpio != -1)
     {
@@ -142,13 +151,17 @@ esp_err_t esp_io_expander_new_i2c_pca95xx_16bit_ex(i2c_port_t i2c_num, uint32_t 
         gpio_config(&io_conf);
         gpio_set_intr_type(pca->int_gpio, GPIO_INTR_NEGEDGE);
         gpio_install_isr_service(ESP_INTR_FLAG_SHARED);
+        // Note: gpio_isr_handler_add usually works, but if service not installed it fails.
+        // We assume board_init or someone installed isr service. If not, this might fail, but let's try.
         gpio_isr_handler_add(pca->int_gpio, io_exp_isr_handler, pca);
     }
 
     pca->base.config.io_count = IO_COUNT;
     pca->base.config.flags.dir_out_bit_zero = 1;
+
     pca->i2c_num = i2c_num;
     pca->i2c_address = i2c_address;
+
     pca->update_interval_us = config->update_interval_us;
     pca->base.read_input_reg = read_input_reg;
     pca->base.write_output_reg = write_output_reg;
@@ -158,7 +171,6 @@ esp_err_t esp_io_expander_new_i2c_pca95xx_16bit_ex(i2c_port_t i2c_num, uint32_t 
     pca->base.del = del;
     pca->base.reset = reset;
 
-    esp_err_t ret = ESP_OK;
     /* Reset configuration and register status */
     ESP_GOTO_ON_ERROR(reset(&pca->base), err, TAG, "Reset failed");
 
@@ -166,7 +178,7 @@ esp_err_t esp_io_expander_new_i2c_pca95xx_16bit_ex(i2c_port_t i2c_num, uint32_t 
     return ESP_OK;
 err:
     free(pca);
-    return ret;
+    return ESP_FAIL;
 }
 
 static esp_err_t read_input_reg(esp_io_expander_handle_t handle, uint32_t *value)
@@ -174,17 +186,19 @@ static esp_err_t read_input_reg(esp_io_expander_handle_t handle, uint32_t *value
     esp_io_expander_pca95xx_16bit_t *pca = (esp_io_expander_pca95xx_16bit_t *)__containerof(handle, esp_io_expander_pca95xx_16bit_t, base);
 
     uint8_t temp[2] = { 0, 0 };
+    uint8_t reg_addr = INPUT_REG_ADDR;
     // *INDENT-OFF*
     if (pca->int_gpio == -1 || pca->need_update || esp_timer_get_time() > (pca->last_update_time + pca->update_interval_us))
     {
         for (uint8_t i = 0; i < I2C_TRY_NUM; i++)
         {
-            if (i2c_master_write_read_device(pca->i2c_num, pca->i2c_address, (uint8_t[]) { INPUT_REG_ADDR }, 1, (uint8_t *)&temp, 2, pdMS_TO_TICKS(I2C_TIMEOUT_MS)) == ESP_OK)
+            // LEGACY CALL
+            if (i2c_master_write_read_device(pca->i2c_num, pca->i2c_address, &reg_addr, 1, temp, 2, pdMS_TO_TICKS(I2C_TIMEOUT_MS)) == ESP_OK)
             {
                 break;
             }
             ESP_LOGW(TAG, "Read input reg failed, retry %d/%d", i + 1, I2C_TRY_NUM);
-            ESP_RETURN_ON_FALSE(i < I2C_TRY_NUM - 1, ESP_ERR_INVALID_STATE, TAG, "Read input reg failed"); 
+            ESP_RETURN_ON_FALSE(i < I2C_TRY_NUM - 1, ESP_ERR_INVALID_STATE, TAG, "Read input reg failed");
         }
         pca->regs.input = (((uint32_t)temp[1]) << 8) | (temp[0]);
         pca->last_update_time = esp_timer_get_time();
@@ -206,6 +220,7 @@ static esp_err_t write_output_reg(esp_io_expander_handle_t handle, uint32_t valu
     uint8_t data[] = { OUTPUT_REG_ADDR, value & 0xff, value >> 8 };
     for (uint8_t i = 0; i < I2C_TRY_NUM; i++)
     {
+        // LEGACY CALL
         if (i2c_master_write_to_device(pca->i2c_num, pca->i2c_address, data, sizeof(data), pdMS_TO_TICKS(I2C_TIMEOUT_MS)) == ESP_OK)
         {
             break;
@@ -233,6 +248,7 @@ static esp_err_t write_direction_reg(esp_io_expander_handle_t handle, uint32_t v
     uint8_t data[] = { DIRECTION_REG_ADDR, value & 0xff, value >> 8 };
     for (uint8_t i = 0; i < I2C_TRY_NUM; i++)
     {
+        // LEGACY CALL
         if (i2c_master_write_to_device(pca->i2c_num, pca->i2c_address, data, sizeof(data), pdMS_TO_TICKS(I2C_TIMEOUT_MS)) == ESP_OK)
         {
             break;
@@ -254,8 +270,8 @@ static esp_err_t read_direction_reg(esp_io_expander_handle_t handle, uint32_t *v
 
 static esp_err_t reset(esp_io_expander_t *handle)
 {
-    esp_io_expander_pca95xx_16bit_t *pca = (esp_io_expander_pca95xx_16bit_t *)__containerof(handle, esp_io_expander_pca95xx_16bit_t, base);
-    pca->need_update = true;
+    // esp_io_expander_pca95xx_16bit_t *pca = (esp_io_expander_pca95xx_16bit_t *)__containerof(handle, esp_io_expander_pca95xx_16bit_t, base);
+    // pca->need_update = true;
     ESP_RETURN_ON_ERROR(write_direction_reg(handle, DIR_REG_DEFAULT_VAL), TAG, "Write dir reg failed");
     ESP_RETURN_ON_ERROR(write_output_reg(handle, OUT_REG_DEFAULT_VAL), TAG, "Write output reg failed");
     return ESP_OK;
@@ -269,6 +285,8 @@ static esp_err_t del(esp_io_expander_t *handle)
         gpio_intr_disable(pca->int_gpio);
         gpio_reset_pin(pca->int_gpio);
     }
+
+    // Legacy: Nothing to delete regarding i2c bus
 
     free(pca);
     return ESP_OK;

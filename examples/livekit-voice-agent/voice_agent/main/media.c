@@ -1,0 +1,111 @@
+#include "esp_check.h"
+#include "esp_log.h"
+#include "board.h"
+#include "av_render_default.h"
+#include "esp_audio_dec_default.h"
+#include "esp_audio_enc_default.h"
+#include "esp_capture_defaults.h"
+#include "esp_capture_sink.h"
+#include "esp_capture_audio_dev_src.h"
+
+#include "media.h"
+
+static const char *TAG = "media";
+
+#define NULL_CHECK(pointer, message) ESP_RETURN_ON_FALSE(pointer != NULL, -1, TAG, message)
+
+typedef struct
+{
+    esp_capture_sink_handle_t capturer_handle;
+    esp_capture_audio_src_if_t *audio_source;
+} capture_system_t;
+
+typedef struct
+{
+    audio_render_handle_t audio_renderer;
+    av_render_handle_t av_renderer_handle;
+} renderer_system_t;
+
+static capture_system_t capturer_system;
+static renderer_system_t renderer_system;
+
+static int build_capturer_system(void)
+{
+    ESP_LOGI(TAG, "Building capturer system...");
+    esp_codec_dev_handle_t record_handle = get_record_handle();
+    NULL_CHECK(record_handle, "Failed to get record handle");
+
+    // Use raw device capture to keep a 48 kHz mic stream (no wake word/AEC).
+    esp_capture_audio_dev_src_cfg_t codec_cfg = { .record_handle = record_handle };
+    capturer_system.audio_source = esp_capture_new_audio_dev_src(&codec_cfg);
+    NULL_CHECK(capturer_system.audio_source, "Failed to create audio source");
+
+    esp_capture_cfg_t cfg = { .sync_mode = ESP_CAPTURE_SYNC_MODE_AUDIO, .audio_src = capturer_system.audio_source };
+    esp_capture_open(&cfg, &capturer_system.capturer_handle);
+    NULL_CHECK(capturer_system.capturer_handle, "Failed to open capture system");
+    ESP_LOGI(TAG, "Capturer system initialized successfully");
+    return 0;
+}
+
+static int build_renderer_system(void)
+{
+    ESP_LOGI(TAG, "Building renderer system...");
+    esp_codec_dev_handle_t render_device = get_playback_handle();
+    ESP_LOGI(TAG, "DEBUG: get_playback_handle() returned: %p (i2s_render_cfg_t size=%d)",
+             (void *)render_device, (int)sizeof(i2s_render_cfg_t));
+    NULL_CHECK(render_device, "Failed to get render device handle");
+
+    i2s_render_cfg_t i2s_cfg = { .play_handle = render_device };
+    renderer_system.audio_renderer = av_render_alloc_i2s_render(&i2s_cfg);
+    NULL_CHECK(renderer_system.audio_renderer, "Failed to create I2S renderer");
+
+    // Set initial speaker volume
+    esp_codec_dev_set_out_vol(i2s_cfg.play_handle, CONFIG_LK_EXAMPLE_SPEAKER_VOLUME);
+    ESP_LOGI(TAG, "Speaker volume set to %d", CONFIG_LK_EXAMPLE_SPEAKER_VOLUME);
+
+    // Smaller buffers reduce playback latency; allow drop to avoid "slow motion" when backlogged.
+    av_render_cfg_t render_cfg = {
+        .audio_render = renderer_system.audio_renderer,
+        .audio_raw_fifo_size = 2 * 4096,      // Reduced from 4*4096 to minimize latency
+        .audio_render_fifo_size = 16 * 1024,  // Reduced from 32*1024 to prevent buffer overflow
+        .allow_drop_data = true,
+    };
+    renderer_system.av_renderer_handle = av_render_open(&render_cfg);
+    NULL_CHECK(renderer_system.av_renderer_handle, "Failed to create AV renderer");
+
+    av_render_audio_frame_info_t frame_info = {
+        .sample_rate = 48000,
+        .channel = 1,  // FIXED: Mono to match incoming audio stream (was 2)
+        .bits_per_sample = 16,
+    };
+    av_render_set_fixed_frame_info(renderer_system.av_renderer_handle, &frame_info);
+
+    ESP_LOGI(TAG, "Renderer configured: %d Hz, %d ch, %d bits",
+             (int)frame_info.sample_rate, (int)frame_info.channel, (int)frame_info.bits_per_sample);
+    ESP_LOGI(TAG, "Audio buffers: raw=%d bytes, render=%d bytes",
+             (int)render_cfg.audio_raw_fifo_size, (int)render_cfg.audio_render_fifo_size);
+
+    return 0;
+}
+
+int media_init(void)
+{
+    // Register default audio encoder and decoder
+    esp_audio_enc_register_default();
+    esp_audio_dec_register_default();
+
+    // Build capturer and renderer systems
+    build_capturer_system();
+    build_renderer_system();
+    return 0;
+}
+
+esp_capture_handle_t media_get_capturer(void)
+{
+    return capturer_system.capturer_handle;
+}
+
+av_render_handle_t media_get_renderer(void)
+{
+    return renderer_system.av_renderer_handle;
+}

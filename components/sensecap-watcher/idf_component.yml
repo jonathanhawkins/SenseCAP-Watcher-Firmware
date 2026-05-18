@@ -19,7 +19,7 @@ dependencies:
     public: true
   
   espressif/esp_codec_dev:
-    version: "1.2.0"
+    version: "1.4.0"
     public: true
   
   led_strip:

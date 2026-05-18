@@ -1,0 +1,21 @@
+dependencies:
+  idf:
+    version: ">=5.4"
+  # NOTE: Do NOT add espressif/es8311 - it conflicts with esp_codec_dev's internal es8311 driver
+  # The esp_codec_dev component includes its own ES8311 and ES7243 drivers
+  espressif/esp_codec_dev:
+    version: "1.4.0"
+  espressif/esp_io_expander: "*"
+  # livekit__livekit is in ../components/ folder, auto-detected by ESP-IDF
+  sensecap-watcher:
+    override_path: "../../../components/sensecap-watcher"
+  esp_io_expander_pca95xx_16bit:
+    override_path: "../../../components/esp_io_expander_pca95xx_16bit"
+  esp_lvgl_port:
+    override_path: "../../../components/esp_lvgl_port"
+  sscma_client:
+    override_path: "../../../components/sscma_client"
+  espressif/esp_lcd_spd2010: "*"
+  espressif/esp_lcd_touch_spd2010: "*"
+  # button version is controlled by sensecap-watcher (3.2.3)
+  led_strip: "*"

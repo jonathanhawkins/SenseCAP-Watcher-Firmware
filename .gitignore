@@ -84,6 +84,28 @@ size_info.txt
 
 # lock files for examples and components
 dependencies.lock
+**/dependencies.lock
 
-# managed_components for examples
+# managed_components for examples (pulled by IDF component manager from
+# idf_component.yml; not source-controlled — added 2026-05-18)
 managed_components
+**/managed_components/
+
+# clangd / editor caches (large, machine-specific — added 2026-05-18)
+**/.cache/
+**/.cache/clangd/
+
+# Python virtual environments and bytecode (added 2026-05-18)
+**/.venv/
+**/venv/
+**/__pycache__/
+*.pyc
+
+# Build/CMake artifacts in nested project trees
+**/cmake-build-*/
+
+# Local secrets / credentials (defence in depth — added 2026-05-18)
+**/.env
+**/.env.local
+**/*.pem
+**/*.key

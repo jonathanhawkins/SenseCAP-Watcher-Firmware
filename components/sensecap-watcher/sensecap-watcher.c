@@ -25,7 +25,7 @@ static esp_lcd_touch_handle_t tp_handle = NULL;
 static sdmmc_card_t *card;
 static esp_codec_dev_handle_t play_dev_handle;
 static esp_codec_dev_handle_t record_dev_handle;
-static  SemaphoreHandle_t codec_mutex = NULL;
+static SemaphoreHandle_t codec_mutex = NULL;
 
 static i2s_chan_handle_t i2s_tx_chan = NULL;
 static i2s_chan_handle_t i2s_rx_chan = NULL;
@@ -92,6 +92,27 @@ void bsp_set_btn_long_release_cb(void (*cb)(void))
     }
 
     lvgl_port_encoder_btn_register_event_cb(tp, BUTTON_LONG_PRESS_UP, bsp_btn_cb, cb);
+}
+
+void bsp_set_btn_single_click_cb(void (*cb)(void))
+{
+    lv_indev_t *tp = NULL;
+    while (1)
+    {
+        tp = lv_indev_get_next(tp);
+        if (tp == NULL || tp->driver->type == LV_INDEV_TYPE_ENCODER)
+        {
+            break;
+        }
+    }
+
+    if (tp == NULL)
+    {
+        ESP_LOGE(TAG, "No encoder found");
+        return;
+    }
+
+    lvgl_port_encoder_btn_register_event_cb(tp, BUTTON_SINGLE_CLICK, bsp_btn_cb, cb);
 }
 
 esp_err_t bsp_i2c_detect(i2c_port_t i2c_num)
@@ -168,7 +189,7 @@ esp_io_expander_handle_t bsp_io_expander_init()
     ret |= esp_io_expander_set_level(io_exp_handle, DRV_IO_EXP_OUTPUT_MASK, 0);
     ret |= esp_io_expander_set_level(io_exp_handle, BSP_PWR_SYSTEM, 1);
     vTaskDelay(100 / portTICK_PERIOD_MS);
-    ret |= esp_io_expander_set_level(io_exp_handle, BSP_PWR_START_UP, 1);
+    ret |= esp_io_expander_set_level(io_exp_handle, BSP_PWR_START_UP | BSP_SSCMA_CLIENT_RST, 1);
     vTaskDelay(50 / portTICK_PERIOD_MS);
 
     uint32_t pin_val = 0;
@@ -245,9 +266,10 @@ esp_err_t bsp_i2c_bus_init(void)
     BSP_ERROR_CHECK_RETURN_ERR(i2c_param_config(BSP_GENERAL_I2C_NUM, &i2c_conf));
     BSP_ERROR_CHECK_RETURN_ERR(i2c_driver_install(BSP_GENERAL_I2C_NUM, i2c_conf.mode, 0, 0, ESP_INTR_FLAG_SHARED));
 
-    // pulldown for lcd i2c
+    // Silence LCD/SPI pins only - DO NOT touch I2C1 (touch) pins GPIO38/39!
+    // Driving GPIO38/39 as push-pull outputs breaks the I2C bus for touch controller
     const gpio_config_t io_config = {
-        .pin_bit_mask = (1ULL << BSP_TOUCH_I2C_SDA) | (1ULL << BSP_TOUCH_I2C_SCL) | (1ULL << BSP_SPI3_HOST_PCLK) | (1ULL << BSP_SPI3_HOST_DATA0) | (1ULL << BSP_SPI3_HOST_DATA1)
+        .pin_bit_mask = (1ULL << BSP_SPI3_HOST_PCLK) | (1ULL << BSP_SPI3_HOST_DATA0) | (1ULL << BSP_SPI3_HOST_DATA1)
                         | (1ULL << BSP_SPI3_HOST_DATA2) | (1ULL << BSP_SPI3_HOST_DATA3) | (1ULL << BSP_LCD_SPI_CS) | (1UL << BSP_LCD_GPIO_BL),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
@@ -255,9 +277,6 @@ esp_err_t bsp_i2c_bus_init(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_config);
-
-    gpio_set_level(BSP_TOUCH_I2C_SDA, 0);
-    gpio_set_level(BSP_TOUCH_I2C_SCL, 0);
 
     gpio_set_level(BSP_LCD_SPI_CS, 0);
     gpio_set_level(BSP_LCD_GPIO_BL, 0);
@@ -1167,7 +1186,7 @@ esp_err_t bsp_codec_mute_set(bool enable)
 esp_err_t bsp_codec_dev_stop(void)
 {
     esp_err_t ret = ESP_OK;
-    
+
     xSemaphoreTake(codec_mutex, portMAX_DELAY);
 
     if (play_dev_handle)
@@ -1179,7 +1198,7 @@ esp_err_t bsp_codec_dev_stop(void)
     {
         ret = esp_codec_dev_close(record_dev_handle);
     }
-    xSemaphoreGive(codec_mutex); 
+    xSemaphoreGive(codec_mutex);
     return ret;
 }
 
@@ -1190,7 +1209,7 @@ esp_err_t bsp_codec_dev_resume(void)
 
 esp_err_t bsp_codec_init(void)
 {
-    codec_mutex =  xSemaphoreCreateMutex();
+    codec_mutex = xSemaphoreCreateMutex();
 
     play_dev_handle = bsp_audio_codec_speaker_init();
     assert((play_dev_handle) && "play_dev_handle not initialized");
@@ -1217,7 +1236,7 @@ esp_err_t bsp_get_feed_data(bool is_get_raw_channel, int16_t *buffer, int buffer
 
     xSemaphoreTake(codec_mutex, portMAX_DELAY);
     ret = esp_codec_dev_read(record_dev_handle, (void *)buffer, buffer_len);
-    xSemaphoreGive(codec_mutex); 
+    xSemaphoreGive(codec_mutex);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to read data from codec device");

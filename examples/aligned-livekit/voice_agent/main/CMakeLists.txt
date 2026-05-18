@@ -1,0 +1,44 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "example.c"
+        "board.c"
+        "media.c"
+        "aligned_client.c"
+        "cmd.c"
+        "ui.c"
+        "pm.c"
+        "volume_control.c"
+        "wifi_scan.c"
+        "wifi_setup.c"
+        "wifi_list.c"
+        "wifi_password.c"
+        "qr_setup.c"
+        "listening_A.c"
+        "listening_B.c"
+        "listening_C.c"
+        "listening_D.c"
+        "listening_E.c"
+        "speaking_A.c"
+        "speaking_B.c"
+        "speaking_C.c"
+        "speaking_D.c"
+        "speaking_E.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        console
+        esp_http_client
+        json
+        esp_netif
+        esp_wifi
+        nvs_flash
+        esp_lcd
+        esp_codec_dev
+        esp_io_expander
+        esp_lcd_spd2010
+        esp_lcd_touch_spd2010
+        esp_lvgl_port
+        lvgl
+        button
+        led_strip
+)

@@ -1,0 +1,85 @@
+# SenseCAP Watcher Configuration for LiveKit Voice Agent
+# This configuration uses Aligned backend for dynamic LiveKit credentials
+
+# ESP32-S3 Target
+CONFIG_IDF_TARGET="esp32s3"
+
+# Disable Sandbox (we use Aligned backend instead)
+# CONFIG_LK_EXAMPLE_USE_SANDBOX is not set
+
+# WiFi Configuration - Configured via console: wifi_sta -s "SSID" -p "password"
+CONFIG_LK_EXAMPLE_USE_WIFI=y
+CONFIG_LK_EXAMPLE_WIFI_SSID=""
+CONFIG_LK_EXAMPLE_WIFI_PASSWORD=""
+
+# Note: Codec board type may need adjustment for Watcher hardware
+# For now, using Korvo-2 defaults until we verify Watcher's audio config
+CONFIG_LK_EXAMPLE_CODEC_BOARD_TYPE="S3_Korvo_V2"
+
+# Audio Settings
+CONFIG_LK_EXAMPLE_SPEAKER_VOLUME=100
+
+# BSP/I2C Settings (may need adjustment for Watcher)
+CONFIG_BSP_I2C_NUM=0
+CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=y
+
+# Performance Optimizations for ESP32-S3
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# WebSocket Client Configuration
+CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER=y
+CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
+
+# ESP32-S3 Memory Configuration
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+
+# Flash Configuration
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+
+# FreeRTOS Configuration
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
+
+# Experimental Features (required for LiveKit SDK)
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# LVGL Configuration
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_LVGL_DRAW_BUFF_HEIGHT=80  # Increased from 40 to reduce screen tearing
+
+# Network Configuration
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
+
+# MBEDTLS (required for WebRTC)
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_SSL_DTLS_SRTP=y
+CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
+
+# Partition Table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+
+# SPIRAM Configuration (ESP32-S3 has PSRAM)
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=256
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=8192
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# Debug Logging Configuration
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
+
+# Enable verbose logging for audio/video components
+# Note: Set these in menuconfig or add to sdkconfig if needed:
+# - AV_RENDER (audio/video rendering)
+# - I2S_RENDER (I2S audio output)
+# - BUF_MNGR (buffer management)
+# - LVGL (UI rendering)
+# - lcd_panel.io.spi (LCD SPI communication)

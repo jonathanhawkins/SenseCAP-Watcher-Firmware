@@ -9,7 +9,10 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
+#include <assert.h>
 
+#include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "esp_err.h"
 #include "esp_io_expander.h"
@@ -31,7 +34,7 @@ typedef struct
  *
  * @note The I2C communication should be initialized before use this function
  *
- * @param i2c_num: I2C port num
+ * @param bus_handle: I2C master bus handle
  * @param i2c_address: I2C address of chip (\see esp_io_expander_pca_95xx_16bit_address)
  * @param handle: IO expander handle
  *
@@ -45,7 +48,7 @@ esp_err_t esp_io_expander_new_i2c_pca95xx_16bit(i2c_port_t i2c_num, uint32_t i2c
  *
  * @note The I2C communication should be initialized before use this function
  *
- * @param i2c_num: I2C port num
+ * @param i2c_num: I2C port number
  * @param i2c_address: I2C address of chip (\see esp_io_expander_pca_95xx_16bit_address)
  * @param config: IO expander configuration
  * @param handle: IO expander handle

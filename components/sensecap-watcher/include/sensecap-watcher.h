@@ -143,8 +143,8 @@
 #define DRV_LCD_LEDC_DUTY_RES (LEDC_TIMER_10_BIT)
 #define DRV_LCD_LEDC_CH       (1)
 
-#define DRV_IO_EXP_INPUT_MASK  (0x20ff) // P0.0 ~ P0.7 | P1.3
-#define DRV_IO_EXP_OUTPUT_MASK (0xDf00) // P1.0 ~ P1.7 & ~P1.3
+#define DRV_IO_EXP_INPUT_MASK  (0x207f) // P0.0 ~ P0.6 | P1.3
+#define DRV_IO_EXP_OUTPUT_MASK (0xDf80) // P0.7 | P1.0 ~ P1.7 & ~P1.3
 
 #define DRV_PCF8563_I2C_ADDR   (0x51)
 #define DRV_PCF8563_TIMEOUT_MS (1000)
@@ -172,7 +172,7 @@
 #define DRV_BASE_PATH_SD    "/sdcard"
 #define DRV_BASE_PATH_FLASH "/spiffs"
 
-#define BSP_PWR_START_UP (BSP_PWR_SDCARD | BSP_PWR_LCD | BSP_PWR_SYSTEM | BSP_PWR_AI_CHIP | BSP_PWR_CODEC_PA | BSP_PWR_GROVE | BSP_PWR_BAT_ADC)
+#define BSP_PWR_START_UP (BSP_PWR_SDCARD | BSP_PWR_LCD | BSP_PWR_SYSTEM | BSP_PWR_AI_CHIP | BSP_PWR_CODEC_PA | BSP_PWR_GROVE | BSP_PWR_BAT_ADC | BSP_SSCMA_CLIENT_RST)
 
 #define DEC2BCD(d) (((((d) / 10) & 0x0f) << 4) + (((d) % 10) & 0x0f))
 #define BCD2DEC(b) (((((b) >> 4) & 0x0F) * 10) + ((b) & 0x0F))
@@ -188,14 +188,22 @@
     }
 
 #define BSP_I2S_SLOT_CONFIG(bits_per_sample, mono_or_stereo)                                                                                                                                           \
-    {                                                                                                                                                                                                  \
-        .data_bit_width = bits_per_sample, .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO, .slot_mode = mono_or_stereo, .slot_mask = I2S_STD_SLOT_BOTH, .ws_width = bits_per_sample, .ws_pol = false,       \
-        .bit_shift = true, .left_align = true, .big_endian = false, .bit_order_lsb = false                                                                                                             \
-    }
+    { .data_bit_width = bits_per_sample,                                                                                                                                                               \
+        .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,                                                                                                                                                     \
+        .slot_mode = mono_or_stereo,                                                                                                                                                                   \
+        .slot_mask = I2S_STD_SLOT_BOTH,                                                                                                                                                                \
+        .ws_width = bits_per_sample,                                                                                                                                                                   \
+        .ws_pol = false,                                                                                                                                                                               \
+        .bit_shift = true,                                                                                                                                                                             \
+        .left_align = true,                                                                                                                                                                            \
+        .big_endian = false,                                                                                                                                                                           \
+        .bit_order_lsb = false }
 
 #define BSP_I2S_DUPLEX_MONO_CFG(_sample_rate)                                                                                                                                                          \
     {                                                                                                                                                                                                  \
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(_sample_rate), .slot_cfg = BSP_I2S_SLOT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO), .gpio_cfg = BSP_I2S_GPIO_CFG,                              \
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(_sample_rate),                                                                                                                                           \
+        .slot_cfg = BSP_I2S_SLOT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),                                                                                                                 \
+        .gpio_cfg = BSP_I2S_GPIO_CFG,                                                                                                                                                                  \
     }
 
 #ifdef __cplusplus
@@ -302,6 +310,7 @@ uint8_t bsp_knob_btn_get_key_value(void *param);
 esp_err_t bsp_knob_btn_deinit(void *param);
 void bsp_set_btn_long_press_cb(void (*cb)(void));
 void bsp_set_btn_long_release_cb(void (*cb)(void));
+void bsp_set_btn_single_click_cb(void (*cb)(void));
 
 esp_err_t bsp_lcd_brightness_set(int brightness_percent);
 esp_lcd_panel_handle_t bsp_lcd_get_panel_handle(void);
