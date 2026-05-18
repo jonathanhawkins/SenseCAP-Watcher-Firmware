@@ -56,8 +56,7 @@ static lv_obj_t *ui_scan_btn = NULL;            // "Scan Again" button
 static lv_obj_t *ui_scan_btn_label = NULL;      // Scan button text
 static lv_obj_t *ui_back_btn = NULL;            // Back button
 static lv_obj_t *ui_back_btn_label = NULL;      // Back button text
-static lv_obj_t *ui_scanning_label = NULL;      // "Scanning..." indicator
-static lv_obj_t *ui_scanning_spinner = NULL;    // Animated spinner shown during scan
+static lv_obj_t *ui_scanning_label = NULL;      // "Scanning..." pulsing indicator
 static lv_obj_t *ui_no_networks_label = NULL;   // "No networks found" label
 
 // Group info for page manager
@@ -117,6 +116,19 @@ static const char* get_signal_bars(int8_t rssi)
 }
 
 /**
+ * @brief lv_anim exec callback: set LV_PART_MAIN opacity on the target object.
+ *
+ * Used to pulse the "Scanning..." label's brightness without moving any pixels
+ * in space. lv_anim's exec_cb signature is (void *var, int32_t val) — it can't
+ * accept the part selector that lv_obj_set_style_opa expects, hence this thin
+ * wrapper.
+ */
+static void scanning_label_opa_cb(void *var, int32_t val)
+{
+    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)val, LV_PART_MAIN);
+}
+
+/**
  * @brief Setup focus styling for encoder navigation
  */
 static void setup_focus_styling(lv_obj_t *obj)
@@ -150,43 +162,26 @@ static void ui_Page_WiFiList_screen_init(void)
     lv_obj_set_style_text_font(ui_list_title, &lv_font_montserrat_14, LV_PART_MAIN);
     lv_obj_align(ui_list_title, LV_ALIGN_TOP_MID, 0, 40);
 
-    // Scanning indicator (hidden by default)
-    // Animated spinner shown while scanning (visual feedback that device is alive).
+    // Scanning indicator: a static label whose opacity pulses.
     //
-    // Why these specific dimensions on a 412x412 round AMOLED at RGB565:
-    //  - Diameter 180: each pixel step along the curve subtends a smaller angle than
-    //    at 140, so the staircase on the arc edge becomes ~1.3x finer-grained.
-    //    180 is the largest that leaves a comfortable gap to the "Scanning..." label
-    //    at y=+65 (spinner bottom 251 vs label top ~264).
-    //  - Arc width 16: software-rendered AA blends across a wider band, so the
-    //    transition pixels actually dilute the step instead of being one lonely
-    //    half-bright pixel between two full-brightness ones (which is what the eye
-    //    reads as "pixelated").
-    //  - Faint track ring (alpha ~40) gives the eye a continuous reference circle;
-    //    the moving arc no longer reads as a disconnected jagged shape floating in
-    //    space, the brain locks onto the smooth dim circle and the moving tip
-    //    against it.
+    // We previously used lv_spinner here, but on this board the rotating arc
+    // TEARED badly. LVGL renders into a 40-line partial buffer per flush
+    // (`CONFIG_LVGL_DRAW_BUFF_HEIGHT=40` in board.c — full 412-line buffer
+    // exceeds available DMA SRAM). The 412 px display needs ~11 strip flushes
+    // per frame; the rotating arc advances during the time it takes to push
+    // each strip to the panel, so each horizontal strip captures the arc at a
+    // slightly different angle. Stacked, that produces vertical comb-tooth
+    // streaks radiating from the arc — fundamentally a partial-buffer + moving
+    // thin geometry artifact, not an LVGL config issue.
     //
-    // Long arc (200°) + slow rotation (2.1 s) intentionally minimises the per-frame
-    // angular delta at the display's ~33 FPS (CONFIG_LV_DISP_DEF_REFR_PERIOD=30ms),
-    // ~5°/frame. Short arcs at fast rotation looked pixelated because the sharp
-    // leading edge jumped multiple pixels each frame.
-    ui_scanning_spinner = lv_spinner_create(ui_Page_WiFiList, 2100, 200);
-    lv_obj_set_size(ui_scanning_spinner, 180, 180);
-    lv_obj_align(ui_scanning_spinner, LV_ALIGN_CENTER, 0, -45);
-    lv_obj_set_style_arc_color(ui_scanning_spinner, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
-    lv_obj_set_style_arc_opa(ui_scanning_spinner, LV_OPA_40, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(ui_scanning_spinner, 16, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(ui_scanning_spinner, lv_color_hex(COLOR_ACCENT), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(ui_scanning_spinner, 16, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_rounded(ui_scanning_spinner, true, LV_PART_INDICATOR);
-    lv_obj_add_flag(ui_scanning_spinner, LV_OBJ_FLAG_HIDDEN);
-
+    // Fix: don't move ANY pixels spatially. A label that never changes (x, y)
+    // can't tear; only the alpha changes between frames. To still convey
+    // "I'm working," pulse the opacity (60% → 100% → 60% over 2 s).
     ui_scanning_label = lv_label_create(ui_Page_WiFiList);
     lv_label_set_text(ui_scanning_label, "Scanning...");
-    lv_obj_set_style_text_color(ui_scanning_label, lv_color_hex(COLOR_TEXT_SECONDARY), LV_PART_MAIN);
+    lv_obj_set_style_text_color(ui_scanning_label, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
     lv_obj_set_style_text_font(ui_scanning_label, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(ui_scanning_label, LV_ALIGN_CENTER, 0, 65);
+    lv_obj_align(ui_scanning_label, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(ui_scanning_label, LV_OBJ_FLAG_HIDDEN);
 
     // No networks found label (hidden by default)
@@ -284,18 +279,31 @@ static void show_scanning_state(bool is_scanning)
     s_scan_in_progress = is_scanning;
 
     if (is_scanning) {
-        // Show scanning indicator (spinner + label), hide list and no-networks label
-        lv_obj_clear_flag(ui_scanning_spinner, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(ui_scanning_label, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ui_network_list, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ui_no_networks_label, LV_OBJ_FLAG_HIDDEN);
+
+        // Start (or restart) the opacity-pulse animation. LVGL anims live on
+        // the global anim list keyed by (var, exec_cb), so a duplicate start
+        // updates the existing one rather than stacking — safe to call from
+        // any scanning-state transition.
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, ui_scanning_label);
+        lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)scanning_label_opa_cb);
+        lv_anim_set_values(&a, LV_OPA_60, LV_OPA_COVER);
+        lv_anim_set_time(&a, 1000);
+        lv_anim_set_playback_time(&a, 1000);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_start(&a);
 
         // Disable scan button during scan
         lv_obj_add_state(ui_scan_btn, LV_STATE_DISABLED);
         lv_label_set_text(ui_scan_btn_label, "Scanning...");
     } else {
-        // Hide scanning indicator
-        lv_obj_add_flag(ui_scanning_spinner, LV_OBJ_FLAG_HIDDEN);
+        // Stop the pulse animation so the LVGL anim list doesn't keep firing
+        // against a hidden widget (cheap but pointless).
+        lv_anim_del(ui_scanning_label, (lv_anim_exec_xcb_t)scanning_label_opa_cb);
         lv_obj_add_flag(ui_scanning_label, LV_OBJ_FLAG_HIDDEN);
 
         // Re-enable scan button
@@ -640,7 +648,6 @@ void wifi_list_deinit(void)
         ui_back_btn = NULL;
         ui_back_btn_label = NULL;
         ui_scanning_label = NULL;
-        ui_scanning_spinner = NULL;
         ui_no_networks_label = NULL;
     }
 
