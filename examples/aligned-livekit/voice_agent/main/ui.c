@@ -91,6 +91,46 @@ static void stop_disconnecting_anim(void)
     s_disconnecting_anim_active = false;
 }
 
+// Opacity pulse for the voice-call status icon while CONNECTING. Same
+// pattern as the disconnecting hint above and the wifi-scan label — we
+// can't shake the icon (any spatial translation tears under the 40-line
+// strip renderer per watcher-ui.md) so we pulse its alpha instead.
+static bool s_voice_icon_anim_active = false;
+static lv_anim_t s_voice_icon_anim;
+
+static void voice_icon_opa_cb(void *var, int32_t val)
+{
+    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)val, LV_PART_MAIN);
+}
+
+static void start_voice_icon_connecting_anim(void)
+{
+    if (voice_status_icon == NULL || s_voice_icon_anim_active) {
+        return;
+    }
+    lv_anim_init(&s_voice_icon_anim);
+    lv_anim_set_var(&s_voice_icon_anim, voice_status_icon);
+    lv_anim_set_exec_cb(&s_voice_icon_anim, (lv_anim_exec_xcb_t)voice_icon_opa_cb);
+    // 40% → 100% gives a clear "fade and breathe" without disappearing.
+    // 600 ms each way ≈ 1.2 s full cycle — slower than the disconnect
+    // pulse (800 ms) so it reads as patient "trying" rather than urgent.
+    lv_anim_set_values(&s_voice_icon_anim, LV_OPA_40, LV_OPA_COVER);
+    lv_anim_set_time(&s_voice_icon_anim, 600);
+    lv_anim_set_playback_time(&s_voice_icon_anim, 600);
+    lv_anim_set_repeat_count(&s_voice_icon_anim, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&s_voice_icon_anim);
+    s_voice_icon_anim_active = true;
+}
+
+static void stop_voice_icon_connecting_anim(void)
+{
+    if (s_voice_icon_anim_active && voice_status_icon) {
+        lv_anim_del(voice_status_icon, NULL);
+        lv_obj_set_style_opa(voice_status_icon, LV_OPA_COVER, LV_PART_MAIN);
+    }
+    s_voice_icon_anim_active = false;
+}
+
 // Timer 2 callback function (500ms image polling)
 static void timer2_callback(lv_timer_t *timer)
 {
@@ -206,6 +246,13 @@ void ui_wifi_connecting(void)
     // the Aligned-logo background of the home screen. The user wants only the
     // boot text gone, not the wallpaper.
     if (label) lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+
+    // Pulse the voice-call icon while we're connecting. Tear-safe
+    // opacity animation only (no spatial motion — see watcher-ui.md).
+    // Stopped by ui_set_voice_active(true) on CONNECTED, by
+    // ui_connection_failed() on FAILED, and by ui_show_wifi_button() on
+    // return to idle.
+    start_voice_icon_connecting_anim();
 
     // Show "Connecting..." in the same slot the "Hold knob to disconnect"
     // hint uses — TOP_MID, 0, 60 — so it sits cleanly under the status bar.
@@ -462,6 +509,10 @@ void ui_set_voice_active(bool active)
 {
     lvgl_port_lock(0);
     s_voice_active = active;
+    // Stop the connecting-pulse on EITHER transition: success (active=true)
+    // moves us to the steady green state, failure/disconnect (active=false)
+    // restores the steady grey state.
+    stop_voice_icon_connecting_anim();
     update_status_bar();
 
     // Directly own the hint widget here rather than going through
@@ -500,6 +551,9 @@ void ui_connection_failed(const char *reason_text)
     ESP_LOGW(TAG, "Showing connection failure: %s", reason_text);
 
     lvgl_port_lock(0);
+
+    // Stop the connecting-pulse — we're no longer trying.
+    stop_voice_icon_connecting_anim();
 
     // Hide the boot scroll label. Keep the listening orb visible — it is the
     // home-screen wallpaper, and the red error label sits on top of it.
@@ -734,6 +788,11 @@ void ui_show_wifi_button(void)
     // Create status bar (always visible when WiFi button system is active)
     create_status_bar();
     update_status_bar();
+
+    // Back to idle home — make sure any leftover connecting-pulse is off.
+    // Normal flow stops it via ui_set_voice_active or ui_connection_failed,
+    // but this is a safety net if we route back to idle without those.
+    stop_voice_icon_connecting_anim();
 
     // We're now back on the idle home screen. End any in-flight disconnect
     // animation and hide the hint slot.
