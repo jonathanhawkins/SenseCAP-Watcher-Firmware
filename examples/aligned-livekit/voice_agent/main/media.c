@@ -70,12 +70,20 @@ static int build_renderer_system(void)
     esp_codec_dev_set_out_vol(i2s_cfg.play_handle, CONFIG_LK_EXAMPLE_SPEAKER_VOLUME);
     ESP_LOGI(TAG, "Speaker volume set to %d", CONFIG_LK_EXAMPLE_SPEAKER_VOLUME);
 
-    // Smaller buffers reduce playback latency; allow drop to avoid "slow motion" when backlogged.
+    // Audio buffer + drop policy — tuned for jitter resilience over absolute
+    // minimum latency. Previous values (raw=2*4096, render=16*1024,
+    // allow_drop_data=true) saved ~85 ms but under WiFi jitter the
+    // renderer dropped frames instead of buffering → audible crackle on
+    // the user's playback. xAI Realtime now lands TTFA in ~280 ms (model
+    // upgrade to grok-voice-think-fast-1.0) so absorbing ~85 ms of buffer
+    // headroom keeps total perceived latency well under 1 s while
+    // eliminating the jitter-induced crackle. `allow_drop_data=false` makes
+    // the renderer back-pressure instead of silently glitching.
     av_render_cfg_t render_cfg = {
         .audio_render = renderer_system.audio_renderer,
-        .audio_raw_fifo_size = 2 * 4096,      // Reduced from 4*4096 to minimize latency
-        .audio_render_fifo_size = 16 * 1024,  // Reduced from 32*1024 to prevent buffer overflow
-        .allow_drop_data = true,
+        .audio_raw_fifo_size = 4 * 4096,      // ~170 ms @ 48kHz mono — jitter headroom
+        .audio_render_fifo_size = 24 * 1024,  // ~256 ms — sustained backpressure room
+        .allow_drop_data = false,             // no silent drops; prefer slight latency over crackle
     };
     renderer_system.av_renderer_handle = av_render_open(&render_cfg);
     NULL_CHECK(renderer_system.av_renderer_handle, "Failed to create AV renderer");
