@@ -161,9 +161,20 @@ void ui_listening(void)
     }
 
     // Status bar + hint are owned by ui_set_voice_active(true), which the
-    // caller invokes immediately after ui_listening() on the CONNECTED state.
-    // Just ensure the widgets exist so that call has something to update.
-    s_voice_active = true;
+    // caller invokes immediately after ui_listening() on the CONNECTED
+    // state. Just ensure the widgets exist so that call has something to
+    // update.
+    //
+    // DO NOT set `s_voice_active = true` here. ui_listening() is ALSO
+    // called from board.c at boot to install the orb as the home wallpaper
+    // — there's no session yet at that point. Setting s_voice_active=true
+    // at boot makes the very first knob press flash "Hold to disconnect..."
+    // via ui_knob_hold_start() (which gates on s_voice_active) before the
+    // join-room flow can show "Connecting...". The CONNECTED path calls
+    // ui_set_voice_active(true) explicitly, which is the only path that
+    // should flip the flag true. The status bar's voice icon already AND's
+    // `s_voice_active && room_is_active()` so it stays grey at boot
+    // regardless of this flag.
     create_status_bar();
     update_status_bar();
     create_hint_label();
@@ -543,10 +554,20 @@ void ui_clear_connection_failure(void)
 
 void ui_knob_hold_start(void)
 {
+    // Outside an active room there's no hint to update — skip BEFORE
+    // taking the LVGL lock. Reasons we gate on `room_is_active()` as well
+    // as `s_voice_active`:
+    //  * room_is_active() is the authoritative session-state check (it's
+    //    held in example.c alongside the room handle). s_voice_active is
+    //    only the UI's idea of session state.
+    //  * Defense-in-depth: if a future change resurrects the boot-time
+    //    s_voice_active=true (or any other path lets it drift), this gate
+    //    still prevents the "Hold to disconnect..." flash on the very
+    //    first knob press from the idle home screen.
+    if (!room_is_active()) {
+        return;
+    }
     lvgl_port_lock(0);
-    // Only show hold feedback while in a voice session and not already
-    // tearing down. Outside a session there's no hint visible anyway, so
-    // changing its text wouldn't be seen.
     if (s_voice_active && !s_disconnecting && hint_label) {
         lv_label_set_text(hint_label, "Hold to disconnect...");
         lv_obj_set_style_text_color(hint_label, lv_color_hex(0xFFFFFF), 0); // white = "we see you"
@@ -558,10 +579,13 @@ void ui_knob_hold_start(void)
 
 void ui_knob_hold_end(void)
 {
+    // Same gate as ui_knob_hold_start — only revert text inside an active
+    // session. Outside a session this would otherwise un-hide the hint
+    // with stale text.
+    if (!room_is_active()) {
+        return;
+    }
     lvgl_port_lock(0);
-    // Revert to the steady "Hold knob to disconnect" only when the
-    // session is still active and we're not handing off to the
-    // disconnecting state (which has its own text/animation).
     if (s_voice_active && !s_disconnecting && hint_label) {
         lv_label_set_text(hint_label, "Hold knob to disconnect");
         lv_obj_set_style_text_color(hint_label, lv_color_hex(0xAAAAAA), 0); // grey
