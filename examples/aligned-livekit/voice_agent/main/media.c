@@ -1,4 +1,3 @@
-#include <string.h>
 #include "esp_check.h"
 #include "esp_log.h"
 #include "board.h"
@@ -11,7 +10,6 @@
 #include "esp_codec_dev.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
-#include "media_lib_os.h"
 
 #include "media.h"
 
@@ -116,44 +114,21 @@ static int build_renderer_system(void)
     return 0;
 }
 
-// Per-thread schedule hook used by media_lib_thread_create_from_scheduler.
-// The av_render component spawns threads named "ARender" (PCM → I2S DMA)
-// and "Adec" (Opus decoder); media_lib defaults are priority=10 / stack=4K.
-//
-// Default-10 already beats LVGL (priority 4) so LVGL render can't preempt
-// audio. The remaining startup-crackle source is WiFi RX bursts (WiFi task
-// runs at ESP-IDF default priority 23) — when the agent's first audio
-// packets arrive in a burst, the WiFi task hogs CPU long enough that the
-// audio decoder misses its DMA refill deadline. Bumping audio to 15
-// (still below WiFi's 23 so packet RX isn't starved) lets it interleave
-// more aggressively with WiFi during bursts and keeps the I2S DMA fed.
-//
-// Stack stays at 4K — these are simple loop threads, no recursion.
-#define WATCHER_AUDIO_THREAD_PRIORITY 15
-
-static void media_thread_sched_cb(const char *thread_name, media_lib_thread_cfg_t *cfg)
-{
-    if (cfg == NULL || thread_name == NULL) {
-        return;
-    }
-    if (strcmp(thread_name, "ARender") == 0 || strcmp(thread_name, "Adec") == 0) {
-        cfg->priority = WATCHER_AUDIO_THREAD_PRIORITY;
-        ESP_LOGI(TAG, "Boosted %s thread to priority %d (above WiFi-induced jitter)",
-                 thread_name, WATCHER_AUDIO_THREAD_PRIORITY);
-    }
-}
+// NOTE: A previous version of this file registered a
+// `media_lib_thread_set_schedule_cb` that bumped the av_render "ARender"
+// and "Adec" threads to priority 15 (defaults are 10) to ride out
+// WiFi-RX-burst CPU contention at session start. It caused the device
+// to crash-loop on join_room — strongly suspect a priority inversion
+// against the LiveKit peer_task or media-lib internal queue locking.
+// Reverted to defaults until we can diagnose properly. Startup
+// crackle remains a known small artifact; pre-roll silence is the
+// next lever to try (see media_init plan in PR description).
 
 int media_init(void)
 {
     // Register default audio encoder and decoder
     esp_audio_enc_register_default();
     esp_audio_dec_register_default();
-
-    // Install our priority-boost callback BEFORE the av_render component
-    // creates its threads — the callback gives the av_render audio decoder
-    // and renderer enough priority headroom to ride out WiFi RX bursts at
-    // session start. media_lib calls the cb once per thread at create-time.
-    media_lib_thread_set_schedule_cb(media_thread_sched_cb);
 
     // Build capturer and renderer systems
     build_capturer_system();
