@@ -361,9 +361,12 @@ static void create_status_bar(void)
     lv_obj_set_style_text_font(wifi_status_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(wifi_status_icon, lv_color_hex(0x808080), 0); // Grey initially
 
-    // Voice chat status icon (using audio symbol)
+    // Voice-session status icon. LV_SYMBOL_CALL (phone receiver) reads
+    // unambiguously as "live voice call" — better than LV_SYMBOL_AUDIO
+    // (music notes) which suggested media playback. Grey when idle, green
+    // when `s_voice_active && room_is_active()` — see update_status_bar().
     voice_status_icon = lv_label_create(status_bar);
-    lv_label_set_text(voice_status_icon, LV_SYMBOL_AUDIO);
+    lv_label_set_text(voice_status_icon, LV_SYMBOL_CALL);
     lv_obj_set_style_text_font(voice_status_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(voice_status_icon, lv_color_hex(0x808080), 0); // Grey initially
 
