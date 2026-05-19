@@ -508,7 +508,12 @@ void ui_connection_failed(const char *reason_text)
     // the failure message.
     if (hint_label) lv_obj_add_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
 
-    // Create or reuse the failure label (centered, red, 14 pt).
+    // Failure label — sits in the same TOP_MID slot as `hint_label`
+    // ("Connecting…" / "Hold knob to disconnect"), just under the status
+    // bar. Previously this was LV_ALIGN_CENTER which overlapped the
+    // wallpaper orb in the middle of the screen, making the message hard
+    // to read against the wave logo. Now it shares the standard status
+    // text slot so the user reads it the same way regardless of state.
     if (!failure_label) {
         failure_label = lv_label_create(lv_scr_act());
         lv_obj_set_style_text_font(failure_label, &lv_font_montserrat_14, 0);
@@ -519,11 +524,14 @@ void ui_connection_failed(const char *reason_text)
         lv_label_set_long_mode(failure_label, LV_LABEL_LONG_WRAP);
     }
     lv_label_set_text(failure_label, reason_text);
-    lv_obj_align(failure_label, LV_ALIGN_CENTER, 0, -10);
+    lv_obj_align(failure_label, LV_ALIGN_TOP_MID, 0, 60);
     lv_obj_clear_flag(failure_label, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(failure_label);
 
-    // Retry hint underneath.
+    // Retry hint anchored to the bottom of the failure_label so it
+    // tracks dynamic wrap height — if the failure message is one line,
+    // the hint sits ~8 px below; if it wraps to two lines, the hint
+    // slides down with it instead of overlapping.
     if (!failure_hint) {
         failure_hint = lv_label_create(lv_scr_act());
         lv_obj_set_style_text_font(failure_hint, &lv_font_montserrat_14, 0);
@@ -531,7 +539,7 @@ void ui_connection_failed(const char *reason_text)
         lv_obj_set_style_text_align(failure_hint, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_text(failure_hint, "Press knob to retry");
     }
-    lv_obj_align(failure_hint, LV_ALIGN_CENTER, 0, 30);
+    lv_obj_align_to(failure_hint, failure_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
     lv_obj_clear_flag(failure_hint, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(failure_hint);
 
