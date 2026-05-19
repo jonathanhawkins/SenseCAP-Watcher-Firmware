@@ -1,6 +1,8 @@
-# ESP-IDF Partition Table for SenseCAP Watcher (8MB Flash)
-# Minimal layout - app is ~7.4MB, so we have minimal overhead
+# ESP-IDF Partition Table for SenseCAP Watcher (32MB Flash)
+# Factory partition was 7808K but the AEC capture pipeline pushed the binary
+# over by ~200K (see media.c, esp_capture_new_audio_aec_src). Bumped to 12M
+# with ~20 MB still free on the 32 MB flash for future growth (OTA, assets).
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,        data,   nvs,     0x9000,   24K,
 phy_init,   data,   phy,     0xf000,   4K,
-factory,    app,  factory,  0x10000,  7808K,
+factory,    app,  factory,  0x10000,  12M,

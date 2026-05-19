@@ -252,9 +252,18 @@ static esp_err_t aligned_http_event_handler(esp_http_client_event_t *evt) {
  *   "session_id": "xxx"
  * }
  */
+static const char *g_last_error_msg = "";
+
+const char* aligned_get_last_error_msg(void) {
+    return g_last_error_msg;
+}
+
 esp_err_t aligned_get_livekit_credentials(void) {
+    g_last_error_msg = "";  // reset before each attempt
+
     if (!aligned_has_token()) {
         ESP_LOGE(TAG, "No device token configured");
+        g_last_error_msg = "Device not paired";
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -291,6 +300,7 @@ esp_err_t aligned_get_livekit_credentials(void) {
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
+        g_last_error_msg = "Backend unreachable";
         esp_http_client_cleanup(client);
         return err;
     }
@@ -298,6 +308,13 @@ esp_err_t aligned_get_livekit_credentials(void) {
     if (status_code != 200) {
         ESP_LOGE(TAG, "API returned error status: %d", status_code);
         ESP_LOGE(TAG, "Response: %s", g_http_response_buffer);
+        if (status_code == 401 || status_code == 403) {
+            g_last_error_msg = "Token rejected";
+        } else if (status_code >= 500) {
+            g_last_error_msg = "Server error";
+        } else {
+            g_last_error_msg = "Connect failed";
+        }
         esp_http_client_cleanup(client);
         return ESP_FAIL;
     }
@@ -308,12 +325,14 @@ esp_err_t aligned_get_livekit_credentials(void) {
     cJSON *response = cJSON_Parse(g_http_response_buffer);
     if (response == NULL) {
         ESP_LOGE(TAG, "Failed to parse JSON response");
+        g_last_error_msg = "Bad response";
         return ESP_FAIL;
     }
 
     cJSON *success = cJSON_GetObjectItem(response, "success");
     if (!cJSON_IsTrue(success)) {
         ESP_LOGE(TAG, "API returned success=false");
+        g_last_error_msg = "Server rejected";
         cJSON_Delete(response);
         return ESP_FAIL;
     }

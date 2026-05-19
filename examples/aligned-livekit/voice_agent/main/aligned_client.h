@@ -110,6 +110,13 @@ const char* aligned_get_room_name(void);
  */
 const char* aligned_get_session_id(void);
 
+/**
+ * Get a brief, user-readable string describing the most recent failure of
+ * aligned_get_livekit_credentials(). Returns "" when there is no failure
+ * to report. The returned string is a static const literal — do not free.
+ */
+const char* aligned_get_last_error_msg(void);
+
 #ifdef __cplusplus
 }
 #endif

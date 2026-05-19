@@ -7,6 +7,7 @@
 #include "esp_capture_defaults.h"
 #include "esp_capture_sink.h"
 #include "esp_capture_audio_dev_src.h"
+#include "esp_codec_dev.h"
 
 #include "media.h"
 
@@ -35,7 +36,15 @@ static int build_capturer_system(void)
     esp_codec_dev_handle_t record_handle = get_record_handle();
     NULL_CHECK(record_handle, "Failed to get record handle");
 
-    // Use raw device capture to keep a 48 kHz mic stream (no wake word/AEC).
+    // Use raw device capture — AEC source was tried (2026-05-18) but caused
+    // LVGL LCD flush to OOM (`ESP_ERR_NO_MEM` on the SPI DMA queue) ~4 s
+    // after CONNECTED, freezing the UI on "Connecting…". The AFE pipeline
+    // pulls in ~50-100 KB of internal SRAM which combined with WebRTC + LVGL
+    // strip buffers + audio FIFOs leaves no room for the SPI DMA queue to
+    // grow during render. Echo loop returns without AEC — to be re-addressed
+    // either by forcing AEC allocations into PSRAM or by half-duplexing the
+    // mic while the agent is speaking. See serial log evidence in
+    // .claude/rules/watcher-livekit-teardown.md.
     esp_capture_audio_dev_src_cfg_t codec_cfg = { .record_handle = record_handle };
     capturer_system.audio_source = esp_capture_new_audio_dev_src(&codec_cfg);
     NULL_CHECK(capturer_system.audio_source, "Failed to create audio source");
@@ -106,6 +115,27 @@ esp_capture_handle_t media_get_capturer(void)
 av_render_handle_t media_get_renderer(void)
 {
     return renderer_system.av_renderer_handle;
+}
+
+void media_set_mic_muted(bool muted)
+{
+    // Hardware-level mute at the codec — when muted, the I2S input stream
+    // delivers silence regardless of what's happening at the mic. We use
+    // this for half-duplex echo suppression while the agent is speaking
+    // (the agent.py side publishes data-channel "speaking"/"listening"
+    // events; example.c::on_data_received drives this). Without AEC this
+    // is what keeps the agent from hearing itself.
+    esp_codec_dev_handle_t record_handle = get_record_handle();
+    if (record_handle == NULL) {
+        // Codec not initialized yet; nothing to do.
+        return;
+    }
+    int rc = esp_codec_dev_set_in_mute(record_handle, muted);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "esp_codec_dev_set_in_mute(%d) failed: %d", (int)muted, rc);
+    } else {
+        ESP_LOGI(TAG, "Mic %s", muted ? "muted" : "unmuted");
+    }
 }
 
 void media_cleanup(void)

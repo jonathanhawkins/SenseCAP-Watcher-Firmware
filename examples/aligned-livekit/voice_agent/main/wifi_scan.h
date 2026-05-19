@@ -276,6 +276,36 @@ int wifi_list_saved_ssids(char ssids[][WIFI_SSID_MAX_LEN], int max);
  */
 bool wifi_has_saved_for_ssid(const char *ssid);
 
+/**
+ * @brief Run a blocking scan and connect to the best saved network in range.
+ *
+ * Performs a synchronous WiFi scan (up to @p scan_timeout_ms), then walks the
+ * saved-credential list (slot 0 first = most recently used) and picks the
+ * first saved SSID that ALSO appears in the scan results. Connects to it and
+ * waits up to @p connect_timeout_ms for GOT_IP.
+ *
+ * This is the boot-time and auto-reconnect entry point — it avoids the
+ * "retry the same out-of-range SSID 15 times then give up" failure mode of
+ * relying solely on the IDF builtin slot.
+ *
+ * @param scan_timeout_ms     Max time to wait for scan completion (e.g. 6000)
+ * @param connect_timeout_ms  Max time to wait for GOT_IP per attempt (e.g. 15000)
+ * @return true if connected with IP, false otherwise (no saved nets visible,
+ *         scan failed, or all attempts timed out)
+ */
+bool wifi_try_connect_best_saved(uint32_t scan_timeout_ms, uint32_t connect_timeout_ms);
+
+/**
+ * @brief Start a background task that auto-reconnects to saved networks.
+ *
+ * While the device is disconnected, this task periodically scans (every
+ * @p interval_ms) and attempts to connect to any visible saved network.
+ * Sleeps while connected. Idempotent — safe to call multiple times.
+ *
+ * @param interval_ms How often to re-scan while disconnected (e.g. 30000)
+ */
+void wifi_start_auto_reconnect_task(uint32_t interval_ms);
+
 #ifdef __cplusplus
 }
 #endif

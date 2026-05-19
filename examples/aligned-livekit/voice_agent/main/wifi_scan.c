@@ -1064,6 +1064,232 @@ bool wifi_forget_credentials_for_ssid(const char *ssid)
     return removed;
 }
 
+/* =====================================================================
+ * Boot-time + auto-reconnect: scan-then-pick-best-saved
+ * =====================================================================
+ *
+ * The naive "esp_wifi_connect() against the IDF builtin slot" path retries
+ * the same SSID 15 times before giving up, which leaves the user staring at
+ * the boot screen if the most-recently-used AP happens to be out of range.
+ *
+ * Instead, scan first, then walk the multi-network credential list (slot 0
+ * is LRU-newest) and connect to the FIRST saved SSID that is actually
+ * visible. Fall back to the WiFi setup UI only if nothing matches.
+ */
+
+/* Synchronously run a scan and wait for completion. Returns true on success. */
+static bool scan_and_wait(uint32_t timeout_ms)
+{
+    if (!s_initialized || s_wifi_event_group == NULL) {
+        return false;
+    }
+
+    /* If a connection is currently in-flight, esp_wifi_scan_start can return
+     * ESP_ERR_WIFI_STATE. The caller is expected to ensure we're idle. */
+    xEventGroupClearBits(s_wifi_event_group, WIFI_SCAN_DONE_BIT);
+    wifi_scan_start();
+
+    EventBits_t bits = xEventGroupWaitBits(
+        s_wifi_event_group,
+        WIFI_SCAN_DONE_BIT,
+        pdTRUE,   /* clear on exit */
+        pdFALSE,
+        pdMS_TO_TICKS(timeout_ms));
+
+    if ((bits & WIFI_SCAN_DONE_BIT) == 0) {
+        ESP_LOGW(TAG, "Scan timed out after %u ms", (unsigned)timeout_ms);
+        /* Stop the scan so the radio is idle for a subsequent connect. */
+        esp_wifi_scan_stop();
+        s_scan_in_progress = false;
+        return false;
+    }
+    return true;
+}
+
+/* Returns true if `ssid` is present in the most-recent scan results. */
+static bool ssid_visible_in_scan(const char *ssid)
+{
+    if (ssid == NULL || ssid[0] == '\0') {
+        return false;
+    }
+    if (xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        return false;
+    }
+    bool found = false;
+    for (uint16_t i = 0; i < s_scan_count; i++) {
+        if (strcmp(s_scan_results[i].ssid, ssid) == 0) {
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_scan_mutex);
+    return found;
+}
+
+/* Wait for either CONNECTED or FAILED to settle. Returns true on success. */
+static bool wait_for_connect(uint32_t timeout_ms)
+{
+    if (s_wifi_event_group == NULL) {
+        return false;
+    }
+    EventBits_t bits = xEventGroupWaitBits(
+        s_wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdTRUE,    /* clear on exit */
+        pdFALSE,   /* either bit */
+        pdMS_TO_TICKS(timeout_ms));
+
+    return (bits & WIFI_CONNECTED_BIT) != 0;
+}
+
+bool wifi_try_connect_best_saved(uint32_t scan_timeout_ms, uint32_t connect_timeout_ms)
+{
+    if (!s_initialized) {
+        wifi_scan_init();
+        if (!s_initialized) {
+            return false;
+        }
+    }
+
+    /* Already connected — nothing to do. */
+    if (s_connection_state == WIFI_STATE_CONNECTED) {
+        return true;
+    }
+
+    /* Gather the saved SSID list (LRU order). */
+    char saved[WIFI_MAX_SAVED_NETWORKS][WIFI_SSID_MAX_LEN];
+    int n_saved = wifi_list_saved_ssids(saved, WIFI_MAX_SAVED_NETWORKS);
+    if (n_saved <= 0) {
+        ESP_LOGI(TAG, "No saved networks in the multi-network store");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Scanning for %d saved network(s)...", n_saved);
+
+    /* If a previous failed-connect attempt left the supplicant in a retry
+     * loop, calm it down so the scan can run cleanly. */
+    if (s_connection_state == WIFI_STATE_CONNECTING) {
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (!scan_and_wait(scan_timeout_ms)) {
+        ESP_LOGW(TAG, "Scan failed — cannot match saved networks");
+        return false;
+    }
+
+    /* Walk saved networks in LRU order; connect to the first visible one. */
+    for (int i = 0; i < n_saved; i++) {
+        if (!ssid_visible_in_scan(saved[i])) {
+            ESP_LOGI(TAG, "  saved[%d] '%s' not visible — skip", i, saved[i]);
+            continue;
+        }
+
+        char password[WIFI_PASSWORD_MAX_LEN] = {0};
+        bool have_pass = wifi_get_saved_password(saved[i], password, sizeof(password));
+        (void)have_pass; /* password may be empty for open networks */
+
+        ESP_LOGI(TAG, "  saved[%d] '%s' visible — attempting connect", i, saved[i]);
+
+        if (s_wifi_event_group) {
+            xEventGroupClearBits(s_wifi_event_group,
+                                 WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+        }
+
+        if (!wifi_connect(saved[i], password)) {
+            ESP_LOGW(TAG, "  wifi_connect('%s') failed to start", saved[i]);
+            continue;
+        }
+
+        if (wait_for_connect(connect_timeout_ms)) {
+            ESP_LOGI(TAG, "✅ Connected to '%s' (%s)",
+                     wifi_get_current_ssid(), wifi_get_current_ip());
+            return true;
+        }
+
+        ESP_LOGW(TAG, "  '%s' failed to connect within %u ms — trying next",
+                 saved[i], (unsigned)connect_timeout_ms);
+        /* Make sure the supplicant isn't still chewing on this SSID before
+         * we try the next one. wifi_connect() resets retry state anyway. */
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    ESP_LOGW(TAG, "No saved network was reachable");
+    /* Avoid leaving the state machine stuck in CONNECTING — that would make
+     * the auto-reconnect task think a connect is in flight. */
+    s_connection_state = WIFI_STATE_DISCONNECTED;
+    s_was_connected = false;
+    return false;
+}
+
+/* ---------- Background auto-reconnect task ---------- */
+
+static TaskHandle_t s_auto_reconnect_task = NULL;
+static volatile uint32_t s_auto_reconnect_interval_ms = 30000;
+
+static void auto_reconnect_task(void *arg)
+{
+    (void)arg;
+    /* Brief settle before the first scan attempt — gives the boot-time
+     * connect call a chance to succeed first. */
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    for (;;) {
+        /* Sleep first; main.c already runs the initial scan/connect. */
+        vTaskDelay(pdMS_TO_TICKS(s_auto_reconnect_interval_ms));
+
+        /* If we're connected, just keep idling. */
+        if (s_connection_state == WIFI_STATE_CONNECTED) {
+            continue;
+        }
+
+        /* Don't fight an in-progress connect attempt (manual user action or
+         * the supplicant's own retry). */
+        if (s_connection_state == WIFI_STATE_CONNECTING) {
+            continue;
+        }
+
+        /* Quick check that we actually have saved creds to try. */
+        char saved[1][WIFI_SSID_MAX_LEN];
+        if (wifi_list_saved_ssids(saved, 1) <= 0) {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "auto-reconnect: scanning for saved networks");
+        if (wifi_try_connect_best_saved(6000, 12000)) {
+            ESP_LOGI(TAG, "auto-reconnect: re-acquired WiFi");
+        }
+    }
+}
+
+void wifi_start_auto_reconnect_task(uint32_t interval_ms)
+{
+    if (s_auto_reconnect_task != NULL) {
+        s_auto_reconnect_interval_ms = interval_ms;
+        return;
+    }
+    s_auto_reconnect_interval_ms = (interval_ms < 5000) ? 5000 : interval_ms;
+
+    /* 4 KB stack — task only does small NVS reads + wifi_connect/scan calls.
+     * The scan-result processing runs on its own task (scan_process_task). */
+    BaseType_t ok = xTaskCreate(
+        auto_reconnect_task,
+        "wifi_reconn",
+        4096,
+        NULL,
+        3,  /* below user-facing tasks */
+        &s_auto_reconnect_task);
+
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create auto-reconnect task");
+        s_auto_reconnect_task = NULL;
+    } else {
+        ESP_LOGI(TAG, "Auto-reconnect task started (interval=%u ms)",
+                 (unsigned)s_auto_reconnect_interval_ms);
+    }
+}
+
 int wifi_list_saved_ssids(char ssids[][WIFI_SSID_MAX_LEN], int max)
 {
     if (ssids == NULL || max <= 0) {

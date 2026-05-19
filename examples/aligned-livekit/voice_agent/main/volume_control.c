@@ -32,16 +32,15 @@ static int64_t s_last_update_time = 0;
 #define VOLUME_KNOB_A   (GPIO_NUM_41)
 #define VOLUME_KNOB_B   (GPIO_NUM_42)
 
-// Volume screen objects - created exactly like factory firmware ui_Page_Slider.c
-static lv_obj_t *ui_Page_Volume = NULL;   // The volume screen (lv_obj_create(NULL))
-static lv_obj_t *ui_volume_container = NULL;  // Container for layout
-static lv_obj_t *ui_volume_label = NULL;      // "Volume" text label
-static lv_obj_t *ui_volume_value = NULL;      // Value label (e.g., "85")
-static lv_obj_t *ui_volume_percent = NULL;    // "%" label
-static lv_obj_t *ui_slider_container = NULL;  // Container for slider
-static lv_obj_t *ui_vslider = NULL;           // Visual slider bar (named like factory)
+// Volume HUD widgets — created directly on the current screen (lv_scr_act())
+// as a true widget overlay instead of a full screen swap. The home-screen orb
+// (Aligned wave logo), status bar, hint label, and WiFi button all stay
+// visible behind the semi-transparent chip.
+static lv_obj_t *ui_volume_overlay = NULL;    // Semi-transparent chip container
+static lv_obj_t *ui_volume_text    = NULL;    // "Volume  75%" label
+static lv_obj_t *ui_vslider        = NULL;    // Visual slider bar
 
-// Group info for volume page objects
+// Group info — kept for any consumers but no longer drives page navigation.
 static GroupInfo group_page_volume;
 
 // Timer for auto-hide
@@ -49,9 +48,6 @@ static lv_timer_t *s_hud_hide_timer = NULL;
 
 // Encoder input device reference
 static lv_indev_t *s_encoder_indev = NULL;
-
-// Previous screen to return to
-static lv_obj_t *s_previous_screen = NULL;
 
 // Forward declarations
 static void hud_hide_timer_cb(lv_timer_t *timer);
@@ -77,118 +73,77 @@ static esp_err_t apply_volume_to_codec(int volume)
 }
 
 /**
- * @brief Create volume screen - EXACTLY like factory firmware ui_Page_Slider_screen_init()
+ * @brief Build the volume HUD chip as an overlay on the current home screen.
+ *
+ * Creates widgets directly on lv_scr_act() rather than swapping screens, so
+ * the home-screen orb (Aligned wave logo), status bar, hint label, and WiFi
+ * button remain visible behind the semi-transparent chip.
  */
 static void ui_Page_Volume_screen_init(void)
 {
-    if (ui_Page_Volume != NULL) {
+    if (ui_volume_overlay != NULL) {
         return;  // Already created
     }
 
-    ESP_LOGI(TAG, "Creating volume screen (factory firmware pattern)");
+    ESP_LOGI(TAG, "Creating volume HUD overlay on current screen");
 
-    // Create screen exactly like factory: lv_obj_create(NULL)
-    ui_Page_Volume = lv_obj_create(NULL);
-    lv_obj_clear_flag(ui_Page_Volume, LV_OBJ_FLAG_SCROLLABLE);
-    // Use distinct dark gray background to make volume HUD clearly visible
-    lv_obj_set_style_bg_color(ui_Page_Volume, lv_color_hex(0x303030), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_Page_Volume, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    ESP_LOGI(TAG, "Volume screen background set to dark gray 0x303030");
+    // Single compact chip just above the WiFi button. ~280×84 leaves the orb
+    // and status bar fully visible. Semi-transparent dark bg so the orb
+    // shows through behind the chip.
+    ui_volume_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(ui_volume_overlay, 280, 84);
+    lv_obj_align(ui_volume_overlay, LV_ALIGN_BOTTOM_MID, 0, -90);
+    lv_obj_clear_flag(ui_volume_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(ui_volume_overlay, 18, 0);
+    lv_obj_set_style_bg_color(ui_volume_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ui_volume_overlay, LV_OPA_70, 0);  // ~70% — orb shows through
+    lv_obj_set_style_border_width(ui_volume_overlay, 0, 0);
+    lv_obj_set_style_shadow_width(ui_volume_overlay, 8, 0);
+    lv_obj_set_style_shadow_color(ui_volume_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ui_volume_overlay, LV_OPA_40, 0);
+    lv_obj_set_style_pad_all(ui_volume_overlay, 12, 0);
+    lv_obj_add_flag(ui_volume_overlay, LV_OBJ_FLAG_HIDDEN);  // Hidden until first volume change
 
-    // Create container for volume info (like ui_bvpb in factory)
-    ui_volume_container = lv_obj_create(ui_Page_Volume);
-    lv_obj_set_width(ui_volume_container, 320);
-    lv_obj_set_height(ui_volume_container, 67);
-    lv_obj_set_x(ui_volume_container, 0);
-    lv_obj_set_y(ui_volume_container, -100);
-    lv_obj_set_align(ui_volume_container, LV_ALIGN_CENTER);
-    lv_obj_set_flex_flow(ui_volume_container, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(ui_volume_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(ui_volume_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(ui_volume_container, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_volume_container, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_color(ui_volume_container, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_opa(ui_volume_container, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    // "Volume  75%" text on top of the chip
+    ui_volume_text = lv_label_create(ui_volume_overlay);
+    lv_label_set_text(ui_volume_text, "Volume  0%");
+    lv_obj_set_style_text_color(ui_volume_text, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ui_volume_text, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(ui_volume_text, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(ui_volume_text, LV_ALIGN_TOP_MID, 0, 0);
 
-    // "Volume" label (like ui_bvbt in factory)
-    ui_volume_label = lv_label_create(ui_volume_container);
-    lv_obj_set_width(ui_volume_label, LV_SIZE_CONTENT);
-    lv_obj_set_height(ui_volume_label, LV_SIZE_CONTENT);
-    lv_obj_set_align(ui_volume_label, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_volume_label, "Volume ");
-    lv_obj_set_style_text_color(ui_volume_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(ui_volume_label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_volume_label, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    // Volume value label (like ui_bvbv in factory)
-    ui_volume_value = lv_label_create(ui_volume_container);
-    lv_obj_set_width(ui_volume_value, LV_SIZE_CONTENT);
-    lv_obj_set_height(ui_volume_value, LV_SIZE_CONTENT);
-    lv_obj_set_align(ui_volume_value, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_volume_value, "0");
-    lv_obj_set_style_text_color(ui_volume_value, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(ui_volume_value, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_volume_value, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    // "%" label (like ui_bvs in factory)
-    ui_volume_percent = lv_label_create(ui_volume_container);
-    lv_obj_set_width(ui_volume_percent, LV_SIZE_CONTENT);
-    lv_obj_set_height(ui_volume_percent, LV_SIZE_CONTENT);
-    lv_obj_set_align(ui_volume_percent, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_volume_percent, "%");
-    lv_obj_set_style_text_color(ui_volume_percent, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(ui_volume_percent, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_volume_percent, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    // Slider container (like ui_vp in factory)
-    ui_slider_container = lv_obj_create(ui_Page_Volume);
-    lv_obj_set_width(ui_slider_container, 380);
-    lv_obj_set_height(ui_slider_container, 100);
-    lv_obj_set_align(ui_slider_container, LV_ALIGN_CENTER);
-    lv_obj_clear_flag(ui_slider_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(ui_slider_container, 40, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(ui_slider_container, lv_color_hex(0x202124), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_slider_container, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_color(ui_slider_container, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_opa(ui_slider_container, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    // Volume slider (like ui_vslider in factory)
-    ui_vslider = lv_slider_create(ui_slider_container);
+    // Thin slider below — green fill on dark track, white knob with green border.
+    ui_vslider = lv_slider_create(ui_volume_overlay);
     lv_slider_set_range(ui_vslider, VOLUME_MIN, VOLUME_MAX);
     lv_slider_set_value(ui_vslider, s_current_volume, LV_ANIM_OFF);
-    lv_obj_set_width(ui_vslider, 250);
-    lv_obj_set_height(ui_vslider, 30);
-    lv_obj_set_align(ui_vslider, LV_ALIGN_CENTER);
-    lv_obj_set_style_bg_color(ui_vslider, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_vslider, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_size(ui_vslider, 240, 10);
+    lv_obj_align(ui_vslider, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_bg_color(ui_vslider, lv_color_hex(0x404040), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(ui_vslider, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ui_vslider, lv_color_hex(0x8FC31F), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(ui_vslider, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(ui_vslider, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(ui_vslider, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_border_color(ui_vslider, lv_color_hex(0x8FC31F), LV_PART_KNOB);
+    lv_obj_set_style_border_opa(ui_vslider, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_border_width(ui_vslider, 3, LV_PART_KNOB);
 
-    // Slider indicator (green like factory: 0x8FC31F)
-    lv_obj_set_style_bg_color(ui_vslider, lv_color_hex(0x8FC31F), LV_PART_INDICATOR | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_vslider, 255, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-
-    // Slider knob
-    lv_obj_set_style_bg_color(ui_vslider, lv_color_hex(0xFFFFFF), LV_PART_KNOB | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(ui_vslider, 255, LV_PART_KNOB | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_color(ui_vslider, lv_color_hex(0x8FC31F), LV_PART_KNOB | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_opa(ui_vslider, 255, LV_PART_KNOB | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(ui_vslider, 4, LV_PART_KNOB | LV_STATE_DEFAULT);
-
-    // Setup group info for this page (like factory initGroup())
+    // Group info kept for compatibility with any consumers that read it.
     group_page_volume.obj_count = 1;
     group_page_volume.group[0] = ui_vslider;
 
-    ESP_LOGI(TAG, "Volume screen created: %p, slider: %p", ui_Page_Volume, ui_vslider);
+    ESP_LOGI(TAG, "Volume overlay created: %p, slider: %p", ui_volume_overlay, ui_vslider);
 }
 
 /**
- * @brief Update volume screen values
+ * @brief Update volume HUD values
  */
 static void volume_screen_update(void)
 {
-    if (ui_volume_value != NULL) {
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%d", s_current_volume);
-        lv_label_set_text(ui_volume_value, buf);
+    if (ui_volume_text != NULL) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "Volume  %d%%", s_current_volume);
+        lv_label_set_text(ui_volume_text, buf);
     }
 
     if (ui_vslider != NULL) {
@@ -348,8 +303,9 @@ esp_err_t volume_control_init(lv_indev_t *encoder)
     lvgl_port_lock(0);
     lv_pm_init(encoder);
 
-    // Create the volume screen
-    ui_Page_Volume_screen_init();
+    // Don't pre-create the volume overlay here — at this point the home
+    // screen isn't fully populated, and we'd attach the overlay to the wrong
+    // parent. It's created lazily on the first show_hud call.
 
     // Create a timer to poll encoder state for volume control
     s_encoder_poll_timer = lv_timer_create(encoder_poll_timer_cb, 10, NULL);  // Poll every 10ms for responsiveness
@@ -379,14 +335,10 @@ void volume_control_deinit(void)
         s_hud_hide_timer = NULL;
     }
 
-    if (ui_Page_Volume != NULL) {
-        lv_obj_del(ui_Page_Volume);
-        ui_Page_Volume = NULL;
-        ui_volume_container = NULL;
-        ui_volume_label = NULL;
-        ui_volume_value = NULL;
-        ui_volume_percent = NULL;
-        ui_slider_container = NULL;
+    if (ui_volume_overlay != NULL) {
+        lv_obj_del(ui_volume_overlay);
+        ui_volume_overlay = NULL;
+        ui_volume_text = NULL;
         ui_vslider = NULL;
     }
 
@@ -454,10 +406,11 @@ void volume_control_down(void)
 }
 
 /**
- * @brief Show the volume HUD
+ * @brief Show the volume HUD as an overlay on the current screen.
  *
- * Uses overlay pattern - does NOT affect the navigation stack.
- * This allows volume to be adjusted while in WiFi setup without corrupting navigation.
+ * The chip sits on top of whatever screen is active (home screen with orb,
+ * status bar, WiFi button) — nothing gets hidden or swapped out. Auto-hides
+ * after VOLUME_HUD_DISPLAY_MS.
  */
 void volume_control_show_hud(void)
 {
@@ -468,35 +421,39 @@ void volume_control_show_hud(void)
         return;
     }
 
-    // Cancel existing hide timer
+    // Cancel existing hide timer (encoder rotation pushes the auto-hide out)
     if (s_hud_hide_timer != NULL) {
         lv_timer_del(s_hud_hide_timer);
         s_hud_hide_timer = NULL;
     }
 
-    // Make sure volume screen exists
-    if (ui_Page_Volume == NULL) {
-        ESP_LOGI(TAG, "Volume screen not created, creating now");
+    // Lazy-build the HUD on first use AND rebuild it if the user has navigated
+    // to a different screen since the last show. The overlay is a child of
+    // lv_scr_act() — if that has changed (e.g. user opened WiFi setup), the
+    // existing chip lives on the wrong screen and would be invisible.
+    lv_obj_t *current_screen = lv_scr_act();
+    if (ui_volume_overlay != NULL && lv_obj_get_parent(ui_volume_overlay) != current_screen) {
+        ESP_LOGI(TAG, "Screen changed; rebuilding volume overlay on current screen");
+        lv_obj_del(ui_volume_overlay);
+        ui_volume_overlay = NULL;
+        ui_volume_text = NULL;
+        ui_vslider = NULL;
+    }
+    if (ui_volume_overlay == NULL) {
+        ESP_LOGI(TAG, "Volume overlay not created, building now");
         ui_Page_Volume_screen_init();
     }
 
     // Update volume display values
     volume_screen_update();
 
-    // Check if we're already on the volume screen
-    lv_obj_t *current = lv_scr_act();
-    if (current != ui_Page_Volume) {
-        s_previous_screen = current;
-        ESP_LOGI(TAG, "Opening volume page as OVERLAY (won't affect nav stack)");
-
-        // Use OVERLAY pattern - doesn't push to navigation stack
-        // This way volume adjustments won't corrupt the WiFi setup navigation
-        lv_pm_open_overlay(&ui_Page_Volume, &ui_Page_Volume_screen_init);
-    } else {
-        ESP_LOGI(TAG, "Already on volume screen, just updating values");
+    // Show the chip on top of all chrome.
+    if (ui_volume_overlay != NULL) {
+        lv_obj_clear_flag(ui_volume_overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(ui_volume_overlay);
     }
 
-    // Create hide timer
+    // Schedule auto-hide.
     s_hud_hide_timer = lv_timer_create(hud_hide_timer_cb, VOLUME_HUD_DISPLAY_MS, NULL);
     lv_timer_set_repeat_count(s_hud_hide_timer, 1);
 
@@ -504,21 +461,22 @@ void volume_control_show_hud(void)
 }
 
 /**
- * @brief Hide the volume HUD and return to previous screen
+ * @brief Hide the volume HUD overlay.
  *
- * Uses overlay close pattern - returns to the page that was showing before overlay.
+ * Just hides the chip widget — doesn't touch the underlying screen or nav stack.
  */
 void volume_control_hide_hud(void)
 {
-    ESP_LOGI(TAG, "Hiding volume overlay, returning to previous screen");
+    ESP_LOGI(TAG, "Hiding volume overlay");
 
     if (!lvgl_port_lock(100)) {
         ESP_LOGW(TAG, "Could not get LVGL lock for HUD hide");
         return;
     }
 
-    // Use overlay close pattern - doesn't affect navigation stack
-    lv_pm_close_overlay();
+    if (ui_volume_overlay != NULL) {
+        lv_obj_add_flag(ui_volume_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
 
     lvgl_port_unlock();
 }

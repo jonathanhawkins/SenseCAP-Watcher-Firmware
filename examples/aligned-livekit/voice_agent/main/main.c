@@ -128,11 +128,19 @@ static void button_task(void *arg)
                 {
                     press_start = now;
                     shutdown_triggered = false;
+                    // Immediate visual feedback that the press is registered.
+                    // No-op when not in a voice session.
+                    ui_knob_hold_start();
                 }
                 else
                 {
                     // Button released - check how long it was held
                     uint32_t held_ms = (now - press_start) * portTICK_PERIOD_MS;
+
+                    // Revert the hint back to its steady text before
+                    // dispatching. If a real disconnect runs, ui_disconnecting()
+                    // will overwrite this immediately.
+                    ui_knob_hold_end();
 
                     // Skip release handling if shutdown was triggered
                     if (!shutdown_triggered)
@@ -175,9 +183,18 @@ static void button_task(void *arg)
 }
 
 /**
- * @brief Connect to WiFi using saved credentials from flash
+ * @brief Connect to WiFi at boot.
  *
- * Uses the wifi_scan module for unified WiFi management.
+ * Strategy:
+ *   1. Init the wifi_scan module (which also kicks an auto-connect to the
+ *      IDF builtin slot — the previous most-recent network).
+ *   2. Wait briefly (8s) for that to succeed. If the most-recent network is
+ *      in range, we connect fast without burning a scan cycle.
+ *   3. Otherwise, scan-and-pick-best-saved: walk the 8-slot saved list in
+ *      LRU order and connect to the first one that's visible in the scan.
+ *   4. Start a background task that keeps trying every 30s while disconnected
+ *      (handles "WiFi briefly dropped, then came back" plus first-boot
+ *      recovery if step 3 found nothing initially).
  */
 static bool connect_wifi_from_flash(void)
 {
@@ -186,47 +203,77 @@ static bool connect_wifi_from_flash(void)
     // Initialize the WiFi scan/connection module
     wifi_scan_init();
 
-    // Check if we have saved credentials
-    if (!wifi_has_saved_credentials())
+    // Always start the auto-reconnect watchdog. It no-ops while connected
+    // and quietly recovers in the background if WiFi drops mid-session.
+    wifi_start_auto_reconnect_task(30000);
+
+    bool any_saved = wifi_has_saved_credentials();
+    {
+        char first_saved[1][WIFI_SSID_MAX_LEN];
+        if (wifi_list_saved_ssids(first_saved, 1) > 0) {
+            any_saved = true;
+        }
+    }
+
+    if (!any_saved)
     {
         ESP_LOGW(TAG, "No WiFi credentials saved in flash");
         ESP_LOGI(TAG, "Use: wifi_sta -s \"SSID\" -p \"password\" then reboot");
         return false;
     }
 
-    // wifi_scan_init() calls esp_wifi_connect() if saved credentials exist
-    // Wait for connection with timeout
-    ESP_LOGI(TAG, "Waiting for connection (timeout: 20s)...");
+    // Phase 1: fast-path — give the IDF builtin slot ~8s to succeed.
+    // If the most-recently-used network is in range, this avoids a scan.
+    ESP_LOGI(TAG, "Trying IDF builtin slot (fast-path, timeout: 8s)...");
 
-    for (int i = 0; i < 200; i++)  // 20 second timeout (200 * 100ms)
+    for (int i = 0; i < 80; i++)  // 8 second fast-path (80 * 100ms)
     {
         wifi_connection_state_t state = wifi_get_state();
 
         if (state == WIFI_STATE_CONNECTED)
         {
-            ESP_LOGI(TAG, "✅ WiFi connected successfully!");
+            ESP_LOGI(TAG, "✅ WiFi connected (fast-path)!");
             ESP_LOGI(TAG, "   SSID: %s", wifi_get_current_ssid());
             ESP_LOGI(TAG, "   IP:   %s", wifi_get_current_ip());
             ESP_LOGI(TAG, "=== WiFi Connection Complete ===");
             return true;
         }
 
+        // FAILED here means the builtin-slot SSID isn't in range or has a
+        // bad password — fall through to the scan-based path rather than
+        // giving up.
         if (state == WIFI_STATE_FAILED)
         {
-            ESP_LOGE(TAG, "❌ WiFi connection failed after retries");
-            return false;
+            ESP_LOGI(TAG, "Builtin-slot AP unreachable — falling back to scan");
+            break;
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    ESP_LOGE(TAG, "❌ WiFi connection timeout (20s)");
+    // Phase 2: scan-and-pick-best — for when the LRU network is out of
+    // range. Walks all saved networks and picks the first visible one.
+    ESP_LOGI(TAG, "Scanning for any reachable saved network...");
+    if (wifi_try_connect_best_saved(6000, 15000))
+    {
+        ESP_LOGI(TAG, "✅ WiFi connected (scan-and-pick)!");
+        ESP_LOGI(TAG, "   SSID: %s", wifi_get_current_ssid());
+        ESP_LOGI(TAG, "   IP:   %s", wifi_get_current_ip());
+        ESP_LOGI(TAG, "=== WiFi Connection Complete ===");
+        return true;
+    }
+
+    ESP_LOGW(TAG, "❌ No saved WiFi network reachable at boot");
+    ESP_LOGI(TAG, "Auto-reconnect task will keep trying every 30s in the background");
     return false;
 }
 
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_INFO);
+    // Silence per-second AEC mic-level spam — it's once a second forever and
+    // drowns out actual debug logs in the UART buffer.
+    esp_log_level_set("AUD_AEC_SRC", ESP_LOG_WARN);
 
     // CRITICAL: Initialize NVS flash before anything else
     esp_err_t ret = nvs_flash_init();
