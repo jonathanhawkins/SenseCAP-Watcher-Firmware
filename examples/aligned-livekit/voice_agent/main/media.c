@@ -8,6 +8,8 @@
 #include "esp_capture_sink.h"
 #include "esp_capture_audio_dev_src.h"
 #include "esp_codec_dev.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
 
 #include "media.h"
 
@@ -125,6 +127,35 @@ av_render_handle_t media_get_renderer(void)
     return renderer_system.av_renderer_handle;
 }
 
+// Defer unmute by this many ms so the renderer's playback FIFO drains
+// before the mic goes live again. Without this delay, the tail of the
+// agent's utterance (up to ~256 ms still in audio_render_fifo_size at
+// 24 KB / 48 kHz mono) leaks into the mic and gets sent back to the
+// agent → it hears itself. Mute on "speaking" is still applied
+// immediately so we never miss the start of the agent's audio.
+#define MIC_UNMUTE_DRAIN_DELAY_MS 300
+static TimerHandle_t s_unmute_timer = NULL;
+
+static void apply_codec_mute(bool muted)
+{
+    esp_codec_dev_handle_t record_handle = get_record_handle();
+    if (record_handle == NULL) {
+        return;
+    }
+    int rc = esp_codec_dev_set_in_mute(record_handle, muted);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "esp_codec_dev_set_in_mute(%d) failed: %d", (int)muted, rc);
+    } else {
+        ESP_LOGI(TAG, "Mic %s", muted ? "muted" : "unmuted");
+    }
+}
+
+static void unmute_timer_cb(TimerHandle_t t)
+{
+    (void)t;
+    apply_codec_mute(false);
+}
+
 void media_set_mic_muted(bool muted)
 {
     // Hardware-level mute at the codec — when muted, the I2S input stream
@@ -133,16 +164,43 @@ void media_set_mic_muted(bool muted)
     // (the agent.py side publishes data-channel "speaking"/"listening"
     // events; example.c::on_data_received drives this). Without AEC this
     // is what keeps the agent from hearing itself.
+    //
+    // Asymmetric timing: MUTE is applied immediately (don't want to miss
+    // the start of the agent's utterance). UN-mute is DELAYED so the
+    // ~256 ms of audio already buffered in the renderer FIFO finishes
+    // playing through the speaker before we open the mic — otherwise the
+    // tail of the agent's reply leaks back as fresh "user input."
     esp_codec_dev_handle_t record_handle = get_record_handle();
     if (record_handle == NULL) {
-        // Codec not initialized yet; nothing to do.
         return;
     }
-    int rc = esp_codec_dev_set_in_mute(record_handle, muted);
-    if (rc != 0) {
-        ESP_LOGW(TAG, "esp_codec_dev_set_in_mute(%d) failed: %d", (int)muted, rc);
+
+    if (muted) {
+        // Mute immediately. If an unmute was pending, cancel it.
+        if (s_unmute_timer != NULL) {
+            xTimerStop(s_unmute_timer, 0);
+        }
+        apply_codec_mute(true);
     } else {
-        ESP_LOGI(TAG, "Mic %s", muted ? "muted" : "unmuted");
+        // Defer unmute by MIC_UNMUTE_DRAIN_DELAY_MS.
+        if (s_unmute_timer == NULL) {
+            s_unmute_timer = xTimerCreate(
+                "mic_unmute",
+                pdMS_TO_TICKS(MIC_UNMUTE_DRAIN_DELAY_MS),
+                pdFALSE,  // one-shot
+                NULL,
+                unmute_timer_cb);
+            if (s_unmute_timer == NULL) {
+                // Timer alloc failed — fall back to immediate unmute. Rare;
+                // would only happen if FreeRTOS timer queue is exhausted.
+                ESP_LOGW(TAG, "unmute timer alloc failed; unmuting immediately");
+                apply_codec_mute(false);
+                return;
+            }
+        }
+        xTimerStop(s_unmute_timer, 0);
+        xTimerChangePeriod(s_unmute_timer, pdMS_TO_TICKS(MIC_UNMUTE_DRAIN_DELAY_MS), 0);
+        xTimerStart(s_unmute_timer, 0);
     }
 }
 
