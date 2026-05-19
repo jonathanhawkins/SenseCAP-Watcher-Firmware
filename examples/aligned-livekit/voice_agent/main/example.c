@@ -1,6 +1,7 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_wifi.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
@@ -233,6 +234,20 @@ void join_room()
     // whole roundtrip and thinks the knob press did nothing.
     ui_wifi_connecting();
 
+    // Disable WiFi power-save for the duration of the voice session.
+    // The IDF default (WIFI_PS_MIN_MODEM) sleeps the radio in ~307 ms
+    // windows, causing audio Opus packets to arrive in bursts. Even with
+    // a 340 ms render FIFO (see media.c), tail-of-burst can graze the
+    // buffer and produce small audible artifacts. WIFI_PS_NONE keeps
+    // the radio awake so audio packets flow smoothly. Re-enabled in
+    // leave_room() so idle battery isn't impacted.
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ps_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(NONE) failed: %s", esp_err_to_name(ps_err));
+    } else {
+        ESP_LOGI(TAG, "WiFi power-save disabled for session");
+    }
+
     // Reset the agent-join failure flag for this attempt. If a stale room
     // handle exists from a prior agent-timeout, leave it (the block below
     // sees it's CONNECTED but flagged failed and tears it down).
@@ -405,6 +420,18 @@ void leave_room()
 
     agent_joined = false;
     s_leaving_room = false;
+
+    // Restore WiFi power-save so the device doesn't burn battery while
+    // idle waiting for the next knob press. Matches the IDF default that
+    // join_room() turned off. Best-effort — if this fails the only cost
+    // is slightly higher idle power.
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    if (ps_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(MIN_MODEM) failed: %s", esp_err_to_name(ps_err));
+    } else {
+        ESP_LOGI(TAG, "WiFi power-save re-enabled (idle)");
+    }
+
     ESP_LOGI(TAG, "Room disconnected successfully");
 }
 

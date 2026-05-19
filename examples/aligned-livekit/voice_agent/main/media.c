@@ -72,20 +72,29 @@ static int build_renderer_system(void)
     esp_codec_dev_set_out_vol(i2s_cfg.play_handle, CONFIG_LK_EXAMPLE_SPEAKER_VOLUME);
     ESP_LOGI(TAG, "Speaker volume set to %d", CONFIG_LK_EXAMPLE_SPEAKER_VOLUME);
 
-    // Audio buffer + drop policy — tuned for jitter resilience over absolute
-    // minimum latency. Previous values (raw=2*4096, render=16*1024,
-    // allow_drop_data=true) saved ~85 ms but under WiFi jitter the
-    // renderer dropped frames instead of buffering → audible crackle on
-    // the user's playback. xAI Realtime now lands TTFA in ~280 ms (model
-    // upgrade to grok-voice-think-fast-1.0) so absorbing ~85 ms of buffer
-    // headroom keeps total perceived latency well under 1 s while
-    // eliminating the jitter-induced crackle. `allow_drop_data=false` makes
-    // the renderer back-pressure instead of silently glitching.
+    // Audio buffer + drop policy — tuned for jitter resilience over
+    // absolute minimum latency.
+    //
+    // History:
+    //   * 2*4096 raw / 16*1024 render / allow_drop_data=true was the
+    //     original aggressive setting — saved ~85 ms but produced audible
+    //     crackle under WiFi jitter (drops instead of buffer).
+    //   * 4*4096 raw / 24*1024 render / drop=false eliminated most
+    //     crackle but the user still heard a small amount.
+    //   * The remaining crackle was traced to WiFi power-save naps
+    //     (WIFI_PS_MIN_MODEM, ~307 ms listen interval) — packets arrive
+    //     in bursts every ~300 ms. The render FIFO at 256 ms couldn't
+    //     absorb the burst tail. Two-part fix: bump render FIFO to
+    //     ~340 ms AND disable WiFi PS during voice sessions
+    //     (see example.c::join_room).
+    //
+    // xAI Realtime's ~280 ms TTFA keeps total perceived latency under
+    // 1 s even with the larger buffers.
     av_render_cfg_t render_cfg = {
         .audio_render = renderer_system.audio_renderer,
-        .audio_raw_fifo_size = 4 * 4096,      // ~170 ms @ 48kHz mono — jitter headroom
-        .audio_render_fifo_size = 24 * 1024,  // ~256 ms — sustained backpressure room
-        .allow_drop_data = false,             // no silent drops; prefer slight latency over crackle
+        .audio_raw_fifo_size = 4 * 4096,      // ~170 ms @ 48kHz mono — Opus FIFO
+        .audio_render_fifo_size = 32 * 1024,  // ~340 ms PCM headroom for burst absorb
+        .allow_drop_data = false,             // no silent drops; prefer latency over crackle
     };
     renderer_system.av_renderer_handle = av_render_open(&render_cfg);
     NULL_CHECK(renderer_system.av_renderer_handle, "Failed to create AV renderer");
