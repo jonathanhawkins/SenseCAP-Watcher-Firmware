@@ -20,6 +20,7 @@ static lv_obj_t *status_bar = NULL;        // Container for status icons
 static lv_obj_t *wifi_status_icon = NULL;  // WiFi icon label
 static lv_obj_t *voice_status_icon = NULL; // Voice chat icon label
 static lv_obj_t *hint_label = NULL;        // "Hold knob to disconnect" hint (under status bar)
+static lv_obj_t *knob_progress_bar = NULL; // Fills 0→100% across BUTTON_LONG_PRESS_MS while held
 static lv_obj_t *failure_label = NULL;     // "Auth failed — re-pair" (centered, red)
 static lv_obj_t *failure_hint  = NULL;     // "Press knob to retry"  (under failure_label, grey)
 static bool s_voice_active = false;        // Track voice chat state
@@ -617,6 +618,47 @@ void ui_clear_connection_failure(void)
 // Knob hold feedback (during active voice session)
 //=============================================================================
 
+// Create the hold-progress bar on first use. Lazy so the idle screen
+// never carries the widget; LVGL heap is 32 KB and we'd rather only
+// pay for it during an active voice session.
+//
+// Position chosen to sit ~8 px below the hint_label (font_montserrat_14
+// at y=60), 140 px wide, 5 px tall. The bar is horizontal so its growth
+// edge advances in x — but values are mutated only under lvgl_port_lock,
+// so a single frame's strips all read the same width. See
+// .claude/rules/watcher-ui.md for the strip-render tearing model that
+// rules this safe (and the spinner unsafe).
+static void ensure_knob_progress_bar(void)
+{
+    if (knob_progress_bar != NULL) {
+        return;
+    }
+    knob_progress_bar = lv_bar_create(lv_scr_act());
+    if (knob_progress_bar == NULL) {
+        ESP_LOGW(TAG, "Failed to create knob progress bar");
+        return;
+    }
+    lv_obj_set_size(knob_progress_bar, 140, 5);
+    lv_obj_align(knob_progress_bar, LV_ALIGN_TOP_MID, 0, 82);
+    lv_bar_set_range(knob_progress_bar, 0, 100);
+    lv_bar_set_value(knob_progress_bar, 0, LV_ANIM_OFF);
+
+    // Background track — dark grey so the white fill reads cleanly.
+    lv_obj_set_style_bg_color(knob_progress_bar, lv_color_hex(0x404040), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(knob_progress_bar,   LV_OPA_COVER,           LV_PART_MAIN);
+    lv_obj_set_style_radius(knob_progress_bar,   3,                       LV_PART_MAIN);
+    lv_obj_set_style_border_width(knob_progress_bar, 0,                  LV_PART_MAIN);
+
+    // Indicator (fill) — starts white to match the "Hold to disconnect..."
+    // hint colour. ui_knob_hold_ready_* swap this to green / amber as the
+    // user crosses each threshold.
+    lv_obj_set_style_bg_color(knob_progress_bar, lv_color_hex(0xFFFFFF), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(knob_progress_bar,   LV_OPA_COVER,           LV_PART_INDICATOR);
+    lv_obj_set_style_radius(knob_progress_bar,   3,                       LV_PART_INDICATOR);
+
+    lv_obj_add_flag(knob_progress_bar, LV_OBJ_FLAG_HIDDEN);
+}
+
 void ui_knob_hold_start(void)
 {
     // Outside an active room there's no hint to update — skip BEFORE
@@ -638,6 +680,17 @@ void ui_knob_hold_start(void)
         lv_obj_set_style_text_color(hint_label, lv_color_hex(0xFFFFFF), 0); // white = "we see you"
         lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(hint_label);
+
+        // Reset progress bar to empty white + show it. Fill grows as the
+        // button_task ticks call ui_knob_hold_progress() while the knob
+        // is held.
+        ensure_knob_progress_bar();
+        if (knob_progress_bar) {
+            lv_bar_set_value(knob_progress_bar, 0, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(knob_progress_bar, lv_color_hex(0xFFFFFF), LV_PART_INDICATOR);
+            lv_obj_clear_flag(knob_progress_bar, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(knob_progress_bar);
+        }
     }
     lvgl_port_unlock();
 }
@@ -654,6 +707,41 @@ void ui_knob_hold_end(void)
     if (s_voice_active && !s_disconnecting && hint_label) {
         lv_label_set_text(hint_label, "Hold knob to disconnect");
         lv_obj_set_style_text_color(hint_label, lv_color_hex(0xAAAAAA), 0); // grey
+    }
+    // Always hide the progress bar on release — irrespective of session
+    // state, we don't want a stale fill stuck on screen.
+    if (knob_progress_bar) {
+        lv_obj_add_flag(knob_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    }
+    lvgl_port_unlock();
+}
+
+void ui_knob_hold_progress(uint8_t pct)
+{
+    // Called by button_task every BUTTON_POLL_MS (25 ms) while the knob
+    // is held. `pct` is clamped to 0–100, mapped from
+    // held_ms / BUTTON_LONG_PRESS_MS so the fill reaches 100% exactly
+    // when the disconnect threshold trips.
+    //
+    // Tearing model: this runs under lvgl_port_lock, which the LVGL
+    // refresh task also takes for the full multi-strip render cycle.
+    // The bar's value therefore stays constant across all strips of
+    // one frame — no inter-strip drift even though the indicator is
+    // horizontal geometry. Per .claude/rules/watcher-ui.md the unsafe
+    // case is animation-engine-driven motion (lv_spinner et al), not
+    // app-driven mutations through the port lock.
+    if (!room_is_active()) {
+        return;
+    }
+    if (pct > 100) pct = 100;
+
+    lvgl_port_lock(0);
+    if (s_voice_active && !s_disconnecting) {
+        ensure_knob_progress_bar();
+        if (knob_progress_bar) {
+            lv_bar_set_value(knob_progress_bar, pct, LV_ANIM_OFF);
+            lv_obj_clear_flag(knob_progress_bar, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     lvgl_port_unlock();
 }
@@ -675,6 +763,12 @@ void ui_knob_hold_ready_disconnect(void)
         lv_obj_set_style_text_color(hint_label, lv_color_hex(0x4CAF50), 0);
         lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(hint_label);
+
+        // Bar reaches the threshold — pin to full + green to mirror text.
+        if (knob_progress_bar) {
+            lv_bar_set_value(knob_progress_bar, 100, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(knob_progress_bar, lv_color_hex(0x4CAF50), LV_PART_INDICATOR);
+        }
     }
     lvgl_port_unlock();
 }
@@ -694,6 +788,12 @@ void ui_knob_hold_ready_sleep(void)
         lv_obj_set_style_text_color(hint_label, lv_color_hex(0xFFB300), 0); // amber
         lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(hint_label);
+
+        // Past the disconnect threshold — bar stays full, swaps to amber.
+        if (knob_progress_bar) {
+            lv_bar_set_value(knob_progress_bar, 100, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(knob_progress_bar, lv_color_hex(0xFFB300), LV_PART_INDICATOR);
+        }
     }
     lvgl_port_unlock();
 }

@@ -3,6 +3,7 @@
 
 #include "lvgl.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 void ui_init(void);
 void ui_switch_speaking(void);
@@ -68,9 +69,22 @@ void ui_knob_hold_start(void);
  * @brief Indicate the user released the knob.
  *
  * Reverts the hint to "Hold knob to disconnect" if the voice session
- * is still active and we're not already mid-disconnect.
+ * is still active and we're not already mid-disconnect. Hides the
+ * hold-progress bar.
  */
 void ui_knob_hold_end(void);
+
+/**
+ * @brief Update the hold-progress bar fill while the knob is held.
+ *
+ * @param pct 0–100, clamped. Mapped from held_ms / BUTTON_LONG_PRESS_MS
+ *            in button_task so the bar reaches 100% exactly when the
+ *            disconnect threshold trips.
+ *
+ * No-op outside an active voice session. Lazily creates the bar widget
+ * on first call.
+ */
+void ui_knob_hold_progress(uint8_t pct);
 
 /**
  * @brief Tell the user they've held long enough to trigger a disconnect.

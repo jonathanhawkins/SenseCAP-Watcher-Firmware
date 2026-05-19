@@ -179,6 +179,17 @@ static void button_task(void *arg)
         {
             uint32_t held_ms = (now - press_start) * portTICK_PERIOD_MS;
 
+            // Smooth fill from 0–100% across the disconnect window. Past
+            // the threshold the ready-disconnect callback below pins it
+            // at 100% and recolors, so we stop pushing values to avoid
+            // overwriting the pinned green/amber state.
+            if (!disconnect_ready_fired)
+            {
+                uint32_t pct = (held_ms * 100U) / BUTTON_LONG_PRESS_MS;
+                if (pct > 100) pct = 100;
+                ui_knob_hold_progress((uint8_t)pct);
+            }
+
             if (!disconnect_ready_fired && held_ms >= BUTTON_LONG_PRESS_MS)
             {
                 disconnect_ready_fired = true;
