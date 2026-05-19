@@ -72,4 +72,24 @@ void ui_knob_hold_start(void);
  */
 void ui_knob_hold_end(void);
 
+/**
+ * @brief Tell the user they've held long enough to trigger a disconnect.
+ *
+ * Fired once during a press, the first time the hold duration crosses
+ * BUTTON_LONG_PRESS_MS (2 s). Swaps the hint to "Release to disconnect"
+ * in green so the user knows releasing NOW will tear down the session
+ * (no need to keep holding). No-op outside an active voice session.
+ */
+void ui_knob_hold_ready_disconnect(void);
+
+/**
+ * @brief Tell the user they've held long enough to trigger deep sleep.
+ *
+ * Fired once during a press, the first time the hold duration crosses
+ * BUTTON_SLEEP_MS (5 s). Swaps the hint to "Release for sleep" in amber.
+ * Past this point a release runs handle_deep_sleep() instead of leaving
+ * the room — the colour change disambiguates the two outcomes.
+ */
+void ui_knob_hold_ready_sleep(void);
+
 #endif // UI_H

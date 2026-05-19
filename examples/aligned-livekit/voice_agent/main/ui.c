@@ -658,6 +658,46 @@ void ui_knob_hold_end(void)
     lvgl_port_unlock();
 }
 
+void ui_knob_hold_ready_disconnect(void)
+{
+    // Fired by button_task when held_ms crosses BUTTON_LONG_PRESS_MS (2 s).
+    // The disconnect itself runs on release, so the user needs to know
+    // they can let go now — otherwise they'll keep holding and risk
+    // overshooting into the 5 s deep-sleep band.
+    if (!room_is_active()) {
+        return;
+    }
+    lvgl_port_lock(0);
+    if (s_voice_active && !s_disconnecting && hint_label) {
+        lv_label_set_text(hint_label, "Release to disconnect");
+        // Material green — same token used for the voice-active status icon,
+        // so the colour reads as "good, go ahead" rather than alarm.
+        lv_obj_set_style_text_color(hint_label, lv_color_hex(0x4CAF50), 0);
+        lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(hint_label);
+    }
+    lvgl_port_unlock();
+}
+
+void ui_knob_hold_ready_sleep(void)
+{
+    // Fired by button_task when held_ms crosses BUTTON_SLEEP_MS (5 s).
+    // Past this point a release runs handle_deep_sleep(), not leave_room.
+    // The amber colour distinguishes "you've gone past the disconnect
+    // window and into the sleep window."
+    if (!room_is_active()) {
+        return;
+    }
+    lvgl_port_lock(0);
+    if (s_voice_active && !s_disconnecting && hint_label) {
+        lv_label_set_text(hint_label, "Release for sleep");
+        lv_obj_set_style_text_color(hint_label, lv_color_hex(0xFFB300), 0); // amber
+        lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(hint_label);
+    }
+    lvgl_port_unlock();
+}
+
 //=============================================================================
 // WiFi Button - Shows when WiFi is disconnected
 //=============================================================================

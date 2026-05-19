@@ -110,6 +110,11 @@ static void button_task(void *arg)
     TickType_t last_change = 0;
     TickType_t press_start = 0;
     bool shutdown_triggered = false;
+    // Per-press one-shot flags so the threshold-crossed UI callbacks fire
+    // exactly once per hold (the loop polls every BUTTON_POLL_MS = 25 ms,
+    // so without the flags we'd re-fire on every tick past the threshold).
+    bool disconnect_ready_fired = false;
+    bool sleep_ready_fired = false;
 
     for (;;)
     {
@@ -128,6 +133,8 @@ static void button_task(void *arg)
                 {
                     press_start = now;
                     shutdown_triggered = false;
+                    disconnect_ready_fired = false;
+                    sleep_ready_fired = false;
                     // Immediate visual feedback that the press is registered.
                     // No-op when not in a voice session.
                     ui_knob_hold_start();
@@ -165,10 +172,23 @@ static void button_task(void *arg)
             }
         }
 
-        // While button is held, check for emergency shutdown (8+ seconds)
+        // While held: fire threshold-crossed UI updates so the user knows
+        // what releasing now will do (the actual dispatch still runs on
+        // release, in the branch above).
         if (last_pressed && !shutdown_triggered)
         {
             uint32_t held_ms = (now - press_start) * portTICK_PERIOD_MS;
+
+            if (!disconnect_ready_fired && held_ms >= BUTTON_LONG_PRESS_MS)
+            {
+                disconnect_ready_fired = true;
+                ui_knob_hold_ready_disconnect();
+            }
+            if (!sleep_ready_fired && held_ms >= BUTTON_SLEEP_MS)
+            {
+                sleep_ready_fired = true;
+                ui_knob_hold_ready_sleep();
+            }
 
             // 8+ seconds = immediate shutdown (emergency power off)
             if (held_ms >= BUTTON_SHUTDOWN_MS)
