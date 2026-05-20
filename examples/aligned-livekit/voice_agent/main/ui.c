@@ -661,21 +661,23 @@ static void ensure_knob_progress_bar(void)
 
 void ui_knob_hold_start(void)
 {
-    // Outside an active room there's no hint to update — skip BEFORE
-    // taking the LVGL lock. Reasons we gate on `room_is_active()` as well
-    // as `s_voice_active`:
-    //  * room_is_active() is the authoritative session-state check (it's
-    //    held in example.c alongside the room handle). s_voice_active is
-    //    only the UI's idea of session state.
-    //  * Defense-in-depth: if a future change resurrects the boot-time
-    //    s_voice_active=true (or any other path lets it drift), this gate
-    //    still prevents the "Hold to disconnect..." flash on the very
-    //    first knob press from the idle home screen.
+    // Gate on `room_is_active()` — this returns true for CONNECTING,
+    // RECONNECTING, AND CONNECTED. Allowing the hold UX during all three
+    // states is critical: if the LiveKit handshake stalls (agent crashes
+    // before joining, WebRTC negotiation never completes, etc.) the user
+    // is stuck on the Connecting… screen with no escape hatch. The
+    // disconnect dispatch in handle_long_release already works for
+    // CONNECTING because room_is_active() returns true there — we just
+    // needed the hint widgets to follow suit.
+    //
+    // The boot-time "first-press flash" defense that the prior
+    // s_voice_active gate provided is still covered by room_is_active():
+    // at boot there's no room_handle, so this function returns early.
     if (!room_is_active()) {
         return;
     }
     lvgl_port_lock(0);
-    if (s_voice_active && !s_disconnecting && hint_label) {
+    if (!s_disconnecting && hint_label) {
         lv_label_set_text(hint_label, "Hold to disconnect...");
         lv_obj_set_style_text_color(hint_label, lv_color_hex(0xFFFFFF), 0); // white = "we see you"
         lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
@@ -697,14 +699,20 @@ void ui_knob_hold_start(void)
 
 void ui_knob_hold_end(void)
 {
-    // Same gate as ui_knob_hold_start — only revert text inside an active
-    // session. Outside a session this would otherwise un-hide the hint
-    // with stale text.
+    // Same broader gate as ui_knob_hold_start — keep the hold UX
+    // available across CONNECTING / RECONNECTING / CONNECTED. The room
+    // can be in any of those states when the user releases.
     if (!room_is_active()) {
         return;
     }
     lvgl_port_lock(0);
-    if (s_voice_active && !s_disconnecting && hint_label) {
+    if (!s_disconnecting && hint_label) {
+        // We don't know whether the room reached CONNECTED before the user
+        // released — if they aborted during Connecting…, the next state
+        // change (`leave_room` → DISCONNECTED → `ui_disconnecting`) will
+        // immediately overwrite this text anyway. The intermediate frame
+        // showing "Hold knob to disconnect" is brief enough to be
+        // imperceptible.
         lv_label_set_text(hint_label, "Hold knob to disconnect");
         lv_obj_set_style_text_color(hint_label, lv_color_hex(0xAAAAAA), 0); // grey
     }
@@ -736,7 +744,7 @@ void ui_knob_hold_progress(uint8_t pct)
     if (pct > 100) pct = 100;
 
     lvgl_port_lock(0);
-    if (s_voice_active && !s_disconnecting) {
+    if (!s_disconnecting) {
         ensure_knob_progress_bar();
         if (knob_progress_bar) {
             lv_bar_set_value(knob_progress_bar, pct, LV_ANIM_OFF);
@@ -756,7 +764,7 @@ void ui_knob_hold_ready_disconnect(void)
         return;
     }
     lvgl_port_lock(0);
-    if (s_voice_active && !s_disconnecting && hint_label) {
+    if (!s_disconnecting && hint_label) {
         lv_label_set_text(hint_label, "Release to disconnect");
         // Material green — same token used for the voice-active status icon,
         // so the colour reads as "good, go ahead" rather than alarm.
@@ -783,7 +791,7 @@ void ui_knob_hold_ready_sleep(void)
         return;
     }
     lvgl_port_lock(0);
-    if (s_voice_active && !s_disconnecting && hint_label) {
+    if (!s_disconnecting && hint_label) {
         lv_label_set_text(hint_label, "Release for sleep");
         lv_obj_set_style_text_color(hint_label, lv_color_hex(0xFFB300), 0); // amber
         lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
