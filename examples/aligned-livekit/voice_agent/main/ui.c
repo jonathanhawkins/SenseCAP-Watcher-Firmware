@@ -92,6 +92,62 @@ static void stop_disconnecting_anim(void)
     s_disconnecting_anim_active = false;
 }
 
+// Watchdog timer — fires if the normal disconnect flow (handle_long_release →
+// leave_room → vTaskDelay(500) → ui_show_wifi_button) doesn't clear the
+// "Disconnecting..." hint within DISCONNECT_WATCHDOG_MS. Two cases this
+// catches:
+//   1. `livekit_room_destroy()` hangs inside leave_room → button_task is
+//      blocked and ui_show_wifi_button is never reached. The UI alone
+//      recovers via this timer (LVGL task runs independent of button_task).
+//   2. Some intermediate path bypassed ui_show_wifi_button (a new code path
+//      we haven't anticipated). Same recovery.
+// Cancelled by ui_show_wifi_button and ui_set_voice_active(true) — both of
+// which are the "we're past disconnecting" states.
+#define DISCONNECT_WATCHDOG_MS 3000
+static lv_timer_t *s_disconnect_watchdog = NULL;
+
+static void cancel_disconnect_watchdog(void)
+{
+    if (s_disconnect_watchdog) {
+        lv_timer_del(s_disconnect_watchdog);
+        s_disconnect_watchdog = NULL;
+    }
+}
+
+static void disconnect_watchdog_cb(lv_timer_t *timer)
+{
+    // Always one-shot — delete first so a re-entrant ui_disconnecting() can
+    // re-arm cleanly. We never want this firing twice on the same stuck state.
+    if (s_disconnect_watchdog == timer) {
+        s_disconnect_watchdog = NULL;
+    }
+    lv_timer_del(timer);
+
+    if (!s_disconnecting) {
+        // Normal flow already cleared it — nothing to do.
+        return;
+    }
+
+    ESP_LOGW(TAG, "[ui] Disconnect watchdog firing — force-clearing stuck "
+                  "\"Disconnecting...\" UI state after %d ms", DISCONNECT_WATCHDOG_MS);
+    stop_disconnecting_anim();
+    s_disconnecting = false;
+    s_voice_active = false;
+    if (hint_label) lv_obj_add_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
+    if (knob_progress_bar) lv_obj_add_flag(knob_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    update_status_bar();
+}
+
+static void arm_disconnect_watchdog(void)
+{
+    cancel_disconnect_watchdog();
+    s_disconnect_watchdog = lv_timer_create(disconnect_watchdog_cb,
+                                             DISCONNECT_WATCHDOG_MS, NULL);
+    if (s_disconnect_watchdog) {
+        lv_timer_set_repeat_count(s_disconnect_watchdog, 1);
+    }
+}
+
 // Opacity pulse for the voice-call status icon while CONNECTING. Same
 // pattern as the disconnecting hint above and the wifi-scan label — we
 // can't shake the icon (any spatial translation tears under the 40-line
@@ -243,6 +299,16 @@ void ui_wifi_connecting(void)
     // Clear any prior failure overlay — the user is retrying.
     if (failure_label) lv_obj_add_flag(failure_label, LV_OBJ_FLAG_HIDDEN);
     if (failure_hint)  lv_obj_add_flag(failure_hint,  LV_OBJ_FLAG_HIDDEN);
+
+    // Clear any stale "Disconnecting..." state from a prior session — the
+    // opacity-pulse anim would otherwise keep flickering the new
+    // "Connecting..." text. Also cancel the disconnect watchdog since the
+    // user reached this path on their own.
+    cancel_disconnect_watchdog();
+    if (s_disconnecting) {
+        stop_disconnecting_anim();
+        s_disconnecting = false;
+    }
     // Hide the boot scroll label, but KEEP the listening orb visible — it is
     // the Aligned-logo background of the home screen. The user wants only the
     // boot text gone, not the wallpaper.
@@ -288,6 +354,12 @@ void ui_disconnecting(void)
     lvgl_port_lock(0);
     s_disconnecting = true;
     s_voice_active = false;
+
+    // Arm the recovery watchdog. If handle_long_release → leave_room hangs
+    // or some path bypasses ui_show_wifi_button, this timer force-clears the
+    // stuck UI state after DISCONNECT_WATCHDOG_MS (3 s) so the user isn't
+    // staring at a frozen "Disconnecting..." screen forever.
+    arm_disconnect_watchdog();
 
     // Stop the speaking→listening transition timer; the listening orb's image
     // poll (timer2) keeps running so the Aligned wallpaper stays animated.
@@ -524,6 +596,7 @@ void ui_set_voice_active(bool active)
         if (active) {
             // Connected — restore the "Hold knob to disconnect" hint and
             // cancel any mid-disconnect animation (re-connect supersedes).
+            cancel_disconnect_watchdog();
             s_disconnecting = false;
             stop_disconnecting_anim();
             lv_label_set_text(hint_label, "Hold knob to disconnect");
@@ -943,7 +1016,9 @@ void ui_show_wifi_button(void)
     stop_voice_icon_connecting_anim();
 
     // We're now back on the idle home screen. End any in-flight disconnect
-    // animation and hide the hint slot.
+    // animation and hide the hint slot. Cancel the disconnect watchdog if it
+    // hasn't fired yet — normal flow reached us, no need for the safety net.
+    cancel_disconnect_watchdog();
     if (s_disconnecting) {
         stop_disconnecting_anim();
         s_disconnecting = false;
