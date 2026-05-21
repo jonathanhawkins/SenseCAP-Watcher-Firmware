@@ -24,7 +24,7 @@ static const char *TAG = "main";
 
 #define BUTTON_POLL_MS        25
 #define BUTTON_DEBOUNCE_MS    50
-#define BUTTON_LONG_PRESS_MS  2250   // 2.25 sec hold = disconnect (felt slightly long at 2s)
+#define BUTTON_LONG_PRESS_MS  1750   // 1.75 sec hold = disconnect (was 2250, snapped tighter per user feedback)
 #define BUTTON_SLEEP_MS       5000   // 5 sec hold = deep sleep (wake on button)
 #define BUTTON_SHUTDOWN_MS    8000   // 8 sec hold = full shutdown
 
