@@ -404,57 +404,60 @@ void ui_disconnecting(void)
 void ui_powering_off(void)
 {
     lvgl_port_lock(0);
-    // Cancel any in-flight disconnect watchdog BEFORE lv_obj_clean — its
-    // callback would otherwise fire during the 500 ms power-off delay and
-    // try to LV_OBJ_FLAG_HIDDEN a now-freed knob_progress_bar pointer
-    // (lv_obj_clean destroys all screen children, freeing the LVGL heap
-    // they occupied; the pointer would dangle until we null it below).
-    //
-    // Same UAF class applies to two ongoing animations:
-    //   - s_disconnecting_anim drives hint_label opacity (freed below)
-    //   - s_voice_icon_anim drives voice_status_icon opacity (freed below
-    //     via status_bar). Started by ui_wifi_connecting at L322; if the
-    //     user holds for shutdown WHILE still connecting, that anim is
-    //     live when we hit lv_obj_clean.
-    // Stop both before lv_obj_clean to avoid the LVGL anim timer firing
-    // against freed memory during the 500 ms vTaskDelay that follows.
+    // Cancel watchdog + transient animations before the 500 ms vTaskDelay
+    // that callers do after this returns — otherwise a fire during the
+    // delay could touch hint_label / voice icon mid-style-change. (The
+    // older version of this function called lv_obj_clean and had to stop
+    // these to avoid UAF on freed widgets; we no longer destroy widgets,
+    // but stopping anims here still gives a clean visual freeze for
+    // shutdown.)
     cancel_disconnect_watchdog();
     stop_disconnecting_anim();
     stop_voice_icon_connecting_anim();
     s_disconnecting = false;
 
-    // Stop any running animation timers
+    // Stop the speaking→listening timer (one-shot, tied to voice activity)
+    // and force the orb back to listening sprites. Without resetting
+    // is_speaking, timer2_callback keeps cycling the SPEAKING images if
+    // shutdown was triggered mid-utterance — the orb would visually argue
+    // with the "Goodbye" hint. (ui_disconnecting does the same reset.)
+    // timer2 itself is left running so the orb wallpaper stays gently
+    // animated while the caller does its post-return shutdown delay —
+    // matches the idle-screen behaviour the user had moments before.
     if (timer1) {
         lv_timer_del(timer1);
         timer1 = NULL;
     }
-    if (timer2) {
-        lv_timer_del(timer2);
-        timer2 = NULL;
-    }
+    is_speaking = false;
     s_voice_active = false;
-    // Clean screen and show power off message
-    lv_obj_clean(lv_scr_act());
-    // Reset pointers since lv_obj_clean destroys all children. knob_progress_bar
-    // was missed in the original list (was added 2026-05-20). Without nulling
-    // it here, any subsequent ensure_knob_progress_bar() would skip creation
-    // and the next access dereferences freed memory.
-    status_bar = NULL;
-    wifi_status_icon = NULL;
-    voice_status_icon = NULL;
-    hint_label = NULL;
-    knob_progress_bar = NULL;
-    wifi_btn = NULL;
-    wifi_btn_label = NULL;
-    img = NULL;
-    label = NULL;
-    failure_label = NULL;
-    failure_hint = NULL;
 
-    lv_obj_t *poweroff_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(poweroff_label, "Goodbye!");
-    lv_obj_set_style_text_font(poweroff_label, &lv_font_montserrat_14, 0);
-    lv_obj_center(poweroff_label);
+    // DON'T lv_obj_clean(lv_scr_act()) — per .claude/rules/watcher-ui.md
+    // the orb `img` IS the home wallpaper; nuking it exposes LVGL's
+    // default white background. Instead hide the widgets that don't
+    // belong on a goodbye screen and reuse the existing chrome (orb,
+    // status bar, WiFi button) so the transition reads as a continuation
+    // rather than a slam-cut to a blank screen.
+    if (label)             lv_obj_add_flag(label,             LV_OBJ_FLAG_HIDDEN);
+    if (failure_label)     lv_obj_add_flag(failure_label,     LV_OBJ_FLAG_HIDDEN);
+    if (failure_hint)      lv_obj_add_flag(failure_hint,      LV_OBJ_FLAG_HIDDEN);
+    if (knob_progress_bar) lv_obj_add_flag(knob_progress_bar, LV_OBJ_FLAG_HIDDEN);
+
+    // s_voice_active=false + room closed → voice icon goes grey.
+    update_status_bar();
+
+    // Reuse the hint label slot under the status bar — the same position
+    // that just showed "Hold knob to disconnect" / "Disconnecting…" /
+    // "Connecting…". Bright white so it reads against the orb.
+    create_hint_label();
+    if (hint_label) {
+        lv_anim_del(hint_label, NULL); // belt-and-suspenders: kill any anim still bound
+        lv_obj_set_style_opa(hint_label, LV_OPA_COVER, LV_PART_MAIN);
+        lv_label_set_text(hint_label, "Goodbye");
+        lv_obj_set_style_text_color(hint_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(hint_label);
+    }
+
     lvgl_port_unlock();
 }
 
@@ -770,24 +773,20 @@ static void ensure_knob_progress_bar(void)
 
 void ui_knob_hold_start(void)
 {
-    // Gate on `room_is_active()` — this returns true for CONNECTING,
-    // RECONNECTING, AND CONNECTED. Allowing the hold UX during all three
-    // states is critical: if the LiveKit handshake stalls (agent crashes
-    // before joining, WebRTC negotiation never completes, etc.) the user
-    // is stuck on the Connecting… screen with no escape hatch. The
-    // disconnect dispatch in handle_long_release already works for
-    // CONNECTING because room_is_active() returns true there — we just
-    // needed the hint widgets to follow suit.
-    //
-    // The boot-time "first-press flash" defense that the prior
-    // s_voice_active gate provided is still covered by room_is_active():
-    // at boot there's no room_handle, so this function returns early.
-    if (!room_is_active()) {
-        return;
-    }
+    // Show the hold UX in two contexts:
+    //   - Voice room active (CONNECTING / RECONNECTING / CONNECTED):
+    //     hint reads "Hold to disconnect..." — release at 1.75 s drops
+    //     the room, release at 5 s+ goes to deep sleep instead.
+    //   - Idle home (no room): hint reads "Hold for sleep..." — release
+    //     under 5 s is a no-op, release at 5 s+ goes to deep sleep.
+    // Both contexts get a progress bar so the long press has visible
+    // feedback. (Earlier this function early-returned when the room
+    // wasn't active, leaving idle-screen sleep holds with no UI feedback
+    // at all until "Goodbye" appeared.)
     lvgl_port_lock(0);
     if (!s_disconnecting && hint_label) {
-        lv_label_set_text(hint_label, "Hold to disconnect...");
+        const bool room_active = room_is_active();
+        lv_label_set_text(hint_label, room_active ? "Hold to disconnect..." : "Hold for sleep...");
         lv_obj_set_style_text_color(hint_label, lv_color_hex(0xFFFFFF), 0); // white = "we see you"
         lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(hint_label);
@@ -808,22 +807,25 @@ void ui_knob_hold_start(void)
 
 void ui_knob_hold_end(void)
 {
-    // Same broader gate as ui_knob_hold_start — keep the hold UX
-    // available across CONNECTING / RECONNECTING / CONNECTED. The room
-    // can be in any of those states when the user releases.
-    if (!room_is_active()) {
-        return;
-    }
     lvgl_port_lock(0);
     if (!s_disconnecting && hint_label) {
-        // We don't know whether the room reached CONNECTED before the user
-        // released — if they aborted during Connecting…, the next state
-        // change (`leave_room` → DISCONNECTED → `ui_disconnecting`) will
-        // immediately overwrite this text anyway. The intermediate frame
-        // showing "Hold knob to disconnect" is brief enough to be
-        // imperceptible.
-        lv_label_set_text(hint_label, "Hold knob to disconnect");
-        lv_obj_set_style_text_color(hint_label, lv_color_hex(0xAAAAAA), 0); // grey
+        if (room_is_active()) {
+            // Voice room: revert to steady-state "Hold knob to disconnect"
+            // grey hint. If the user actually crossed the disconnect
+            // threshold, ui_disconnecting() will overwrite this almost
+            // immediately, so the intermediate frame is imperceptible.
+            lv_label_set_text(hint_label, "Hold knob to disconnect");
+            lv_obj_set_style_text_color(hint_label, lv_color_hex(0xAAAAAA), 0); // grey
+        } else {
+            // Idle home: hide the hint entirely so the orb stays clean.
+            // If the user crossed the sleep threshold, ui_powering_off()
+            // will repaint this label with "Goodbye" in the next ~ms.
+            // NOTE: this assumes the idle-home hint slot is owned solely
+            // by the knob-hold UX. If a future feature shows hint_label
+            // from another idle-context path (e.g. a transient toast), a
+            // hold+release would erase it — gate this hide accordingly.
+            lv_obj_add_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     // Always hide the progress bar on release — irrespective of session
     // state, we don't want a stale fill stuck on screen.
@@ -836,9 +838,12 @@ void ui_knob_hold_end(void)
 void ui_knob_hold_progress(uint8_t pct)
 {
     // Called by button_task every BUTTON_POLL_MS (25 ms) while the knob
-    // is held. `pct` is clamped to 0–100, mapped from
-    // held_ms / BUTTON_LONG_PRESS_MS so the fill reaches 100% exactly
-    // when the disconnect threshold trips.
+    // is held. `pct` is clamped to 0–100; button_task picks the right
+    // mapping based on room state:
+    //   - Room active: held_ms / BUTTON_LONG_PRESS_MS so the fill reaches
+    //     100% at the disconnect threshold (1.75 s).
+    //   - Idle home: held_ms / BUTTON_SLEEP_MS so the fill reaches 100%
+    //     at the sleep threshold (5 s).
     //
     // Tearing model: this runs under lvgl_port_lock, which the LVGL
     // refresh task also takes for the full multi-strip render cycle.
@@ -847,9 +852,6 @@ void ui_knob_hold_progress(uint8_t pct)
     // horizontal geometry. Per .claude/rules/watcher-ui.md the unsafe
     // case is animation-engine-driven motion (lv_spinner et al), not
     // app-driven mutations through the port lock.
-    if (!room_is_active()) {
-        return;
-    }
     if (pct > 100) pct = 100;
 
     lvgl_port_lock(0);
@@ -896,9 +898,9 @@ void ui_knob_hold_ready_sleep(void)
     // Past this point a release runs handle_deep_sleep(), not leave_room.
     // The amber colour distinguishes "you've gone past the disconnect
     // window and into the sleep window."
-    if (!room_is_active()) {
-        return;
-    }
+    //
+    // Works for both contexts: room-active (just past the disconnect
+    // threshold) and idle-home (this IS the only meaningful threshold).
     lvgl_port_lock(0);
     if (!s_disconnecting && hint_label) {
         lv_label_set_text(hint_label, "Release for sleep");

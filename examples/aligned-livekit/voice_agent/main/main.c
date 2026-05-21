@@ -17,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "esp_sleep.h"
 
 #include "livekit.h"
 
@@ -178,19 +179,40 @@ static void button_task(void *arg)
         if (last_pressed && !shutdown_triggered)
         {
             uint32_t held_ms = (now - press_start) * portTICK_PERIOD_MS;
+            bool room_active = room_is_active();
 
-            // Smooth fill from 0–100% across the disconnect window. Past
-            // the threshold the ready-disconnect callback below pins it
-            // at 100% and recolors, so we stop pushing values to avoid
-            // overwriting the pinned green/amber state.
-            if (!disconnect_ready_fired)
+            // Pick the right denominator for the progress fill:
+            //   - Voice room active: bar fills over BUTTON_LONG_PRESS_MS
+            //     (1.75 s) so it tops out exactly at the disconnect
+            //     threshold. ui_knob_hold_ready_disconnect pins it green;
+            //     ui_knob_hold_ready_sleep then swaps to amber at 5 s.
+            //   - Idle home: there's no disconnect threshold to hit, so
+            //     fill over BUTTON_SLEEP_MS (5 s) — the bar tops out
+            //     exactly when ui_knob_hold_ready_sleep recolors it amber.
+            //
+            // Stop pushing progress values once we've entered a "pinned"
+            // state — disconnect-ready or sleep-ready — so the white fill
+            // writes don't overwrite the green/amber. Note: once
+            // disconnect_ready has fired we stay pinned even if the room
+            // subsequently drops (CONNECTED→DISCONNECTED mid-hold). Without
+            // that, room_active flipping false would un-pin and resume
+            // white progress over the pinned green — a jarring flicker.
+            // (Release still does the right thing: handle_long_release
+            // no-ops when the room has already dropped.)
+            uint32_t progress_window_ms = room_active ? BUTTON_LONG_PRESS_MS : BUTTON_SLEEP_MS;
+            bool progress_pinned = sleep_ready_fired || disconnect_ready_fired;
+            if (!progress_pinned)
             {
-                uint32_t pct = (held_ms * 100U) / BUTTON_LONG_PRESS_MS;
+                uint32_t pct = (held_ms * 100U) / progress_window_ms;
                 if (pct > 100) pct = 100;
                 ui_knob_hold_progress((uint8_t)pct);
             }
 
-            if (!disconnect_ready_fired && held_ms >= BUTTON_LONG_PRESS_MS)
+            // Only fire the disconnect-ready callback when there's
+            // actually a room to disconnect from. On idle home a release
+            // before 5 s is a no-op (handle_long_release returns early),
+            // so green-amber "Release to disconnect" would be misleading.
+            if (room_active && !disconnect_ready_fired && held_ms >= BUTTON_LONG_PRESS_MS)
             {
                 disconnect_ready_fired = true;
                 ui_knob_hold_ready_disconnect();
@@ -305,6 +327,44 @@ void app_main(void)
     // Silence per-second AEC mic-level spam — it's once a second forever and
     // drowns out actual debug logs in the UART buffer.
     esp_log_level_set("AUD_AEC_SRC", ESP_LOG_WARN);
+
+    // Log both reset_reason (why the CPU booted) and wake_cause (which
+    // peripheral, if any, woke deep sleep). Together they distinguish:
+    //   - reset=POWERON, wake=UNDEFINED  → cold boot / USB plug
+    //   - reset=DEEPSLEEP, wake=EXT0     → wake from deep sleep. Could be
+    //     a real knob press OR a spurious charge-controller wake; the
+    //     board_init spurious-wake recovery re-sleeps if the knob isn't
+    //     actually pressed. See .claude/rules/watcher-power.md.
+    //   - reset=BROWNOUT / PANIC / WDT   → not a deep-sleep wake at all;
+    //     peripheral power-down dropped a rail or something panicked
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+    const char *reset_str = "?";
+    switch (reset_reason) {
+        case ESP_RST_POWERON:   reset_str = "POWERON";   break;
+        case ESP_RST_EXT:       reset_str = "EXT";       break;
+        case ESP_RST_SW:        reset_str = "SW";        break;
+        case ESP_RST_PANIC:     reset_str = "PANIC";     break;
+        case ESP_RST_INT_WDT:   reset_str = "INT_WDT";   break;
+        case ESP_RST_TASK_WDT:  reset_str = "TASK_WDT";  break;
+        case ESP_RST_WDT:       reset_str = "WDT";       break;
+        case ESP_RST_DEEPSLEEP: reset_str = "DEEPSLEEP"; break;
+        case ESP_RST_BROWNOUT:  reset_str = "BROWNOUT";  break;
+        case ESP_RST_SDIO:      reset_str = "SDIO";      break;
+        default: break;
+    }
+    const char *wake_str = "?";
+    switch (wake_cause) {
+        case ESP_SLEEP_WAKEUP_UNDEFINED: wake_str = "UNDEFINED"; break;
+        case ESP_SLEEP_WAKEUP_EXT0:      wake_str = "EXT0";      break;
+        case ESP_SLEEP_WAKEUP_EXT1:      wake_str = "EXT1";      break;
+        case ESP_SLEEP_WAKEUP_TIMER:     wake_str = "TIMER";     break;
+        case ESP_SLEEP_WAKEUP_TOUCHPAD:  wake_str = "TOUCHPAD";  break;
+        case ESP_SLEEP_WAKEUP_ULP:       wake_str = "ULP";       break;
+        case ESP_SLEEP_WAKEUP_GPIO:      wake_str = "GPIO";      break;
+        default: break;
+    }
+    ESP_LOGI(TAG, "Boot: reset_reason=%s wake_cause=%s", reset_str, wake_str);
 
     // CRITICAL: Initialize NVS flash before anything else
     esp_err_t ret = nvs_flash_init();

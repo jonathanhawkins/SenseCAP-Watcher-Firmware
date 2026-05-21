@@ -872,6 +872,70 @@ void board_init()
         ESP_LOGE(TAG, "Critical: IO Expander init failed");
     }
 
+    // Spurious EXT0 wake recovery.
+    //
+    // The IO expander INT line is the only EXT0 wake source on this board.
+    // It asserts on ANY input-pin change — knob press AND charge controller
+    // events (CHRG_DET, STDBY_DET, VBUS_IN_DET, BAT_DET). The PCA9535 has
+    // no per-pin interrupt mask, so we can't filter at the chip; we have
+    // to detect spurious wakes at boot and immediately re-sleep.
+    //
+    // Verified 2026-05-21 via serial log: device woke from deep sleep with
+    // `wake_cause=EXT0` despite the IO expander INT line having been
+    // continuously HIGH for 200ms straight on both digital and RTC
+    // subsystems immediately before esp_deep_sleep_start(). Means the
+    // wake transition happened AFTER sleep entry — almost certainly the
+    // charge controller doing a top-off cycle while battery is full on USB.
+    //
+    // This check must run AFTER io_exp_handle init but BEFORE LCD/LVGL/etc.
+    // so the user sees no display flash on a spurious wake — to them it
+    // looks like the device stayed asleep.
+    if (io_exp_handle != NULL && esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)
+    {
+        // Poll the knob briefly. The EXT0 wake might have been caused by
+        // a legitimate knob press AND the user might have released by
+        // the time we get here. Without polling we'd resleep on every
+        // tap shorter than ~100ms. With 100ms of polling we catch most
+        // human button presses.
+        bool knob_seen_pressed = false;
+        for (int i = 0; i < 10; i++)
+        {
+            if (board_is_knob_pressed())
+            {
+                knob_seen_pressed = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        // Dump state for diagnostics even if we proceed with boot.
+        uint32_t input_state = 0;
+        esp_io_expander_get_level(io_exp_handle, 0xFFFF, &input_state);
+        ESP_LOGI(TAG, "EXT0 wake recovery: knob_seen_pressed=%d io_input=0x%04lx "
+                 "(chrg=%lu stdby=%lu vbus=%lu knob=%lu bat=%lu)",
+                 knob_seen_pressed,
+                 (unsigned long)(input_state & 0xFFFF),
+                 (unsigned long)((input_state >> 0)  & 1),
+                 (unsigned long)((input_state >> 1)  & 1),
+                 (unsigned long)((input_state >> 2)  & 1),
+                 (unsigned long)((input_state >> 3)  & 1),
+                 (unsigned long)((input_state >> 11) & 1));
+
+        if (!knob_seen_pressed)
+        {
+            ESP_LOGI(TAG, "Spurious EXT0 wake (no knob press detected) - re-entering deep sleep");
+            bsp_system_deep_sleep(0);
+            // bsp_system_deep_sleep() does not return. If it ever does
+            // (future variant, sleep entry failure), don't fall through
+            // into a half-initialized boot with no LCD/touch/audio — log
+            // and restart cleanly.
+            ESP_LOGE(TAG, "bsp_system_deep_sleep returned unexpectedly - restarting");
+            esp_restart();
+        }
+
+        ESP_LOGI(TAG, "EXT0 wake confirmed real (knob press) - proceeding with boot");
+    }
+
     ESP_LOGI(TAG, "Initializing LCD panel before touch...");
     if (bsp_lcd_panel_init() == ESP_OK)
     {
@@ -974,11 +1038,16 @@ void bsp_system_deep_sleep(uint32_t time_in_sec)
 {
     ESP_LOGI(TAG, "Preparing for deep sleep...");
 
-    // Wait for button to be fully released and stable
-    // This prevents immediate wake from the button release interrupt
+    // Wait for button to be fully released and stable.
+    // This prevents immediate wake from the button release interrupt.
+    // Capped at ~3 s wall-clock so a stuck-low knob input (hardware fault,
+    // debris, expander stuck) can't hang the entire sleep path forever —
+    // we proceed to sleep anyway after the ceiling and log it.
     ESP_LOGI(TAG, "Waiting for button release to stabilize...");
     int stable_count = 0;
-    while (stable_count < 10)  // Need 10 consecutive "not pressed" readings
+    int release_attempts = 0;
+    const int RELEASE_MAX_ATTEMPTS = 60; // 60 * 50 ms = 3 s
+    while (stable_count < 10 && release_attempts < RELEASE_MAX_ATTEMPTS)  // 10 consecutive "not pressed"
     {
         if (board_is_knob_pressed())
         {
@@ -989,40 +1058,16 @@ void bsp_system_deep_sleep(uint32_t time_in_sec)
             stable_count++;
         }
         vTaskDelay(pdMS_TO_TICKS(50));  // Check every 50ms
+        release_attempts++;
     }
-    ESP_LOGI(TAG, "Button released and stable");
-
-    // Clear any pending IO expander interrupts by reading the input port
-    // On PCA95xx, reading inputs clears the interrupt
-    if (io_exp_handle != NULL)
+    if (stable_count < 10)
     {
-        uint32_t dummy;
-        esp_io_expander_get_level(io_exp_handle, 0xFFFF, &dummy);
-        ESP_LOGI(TAG, "IO expander interrupt cleared");
-    }
-
-    // Wait for interrupt line to go HIGH (inactive)
-    ESP_LOGI(TAG, "Waiting for interrupt line to stabilize...");
-    int attempts = 0;
-    while (gpio_get_level(BSP_IO_EXPANDER_INT) == 0 && attempts < 20)
-    {
-        // Read inputs again to clear interrupt
-        if (io_exp_handle != NULL)
-        {
-            uint32_t dummy;
-            esp_io_expander_get_level(io_exp_handle, 0xFFFF, &dummy);
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-        attempts++;
-    }
-
-    if (gpio_get_level(BSP_IO_EXPANDER_INT) == 0)
-    {
-        ESP_LOGW(TAG, "Interrupt line still low after timeout - sleep may wake immediately");
+        ESP_LOGW(TAG, "Button release never stabilized (%d attempts) - knob may be stuck; sleeping anyway",
+                 release_attempts);
     }
     else
     {
-        ESP_LOGI(TAG, "Interrupt line HIGH - ready for sleep");
+        ESP_LOGI(TAG, "Button released and stable");
     }
 
     if (time_in_sec > 0)
@@ -1030,21 +1075,165 @@ void bsp_system_deep_sleep(uint32_t time_in_sec)
         esp_sleep_enable_timer_wakeup(time_in_sec * 1000000ULL);
     }
 
-    // Turn off peripherals to save power
+    // Turn off peripherals to save power. This MUST happen BEFORE the
+    // final INT-stabilization loop — cutting power to SDCARD / LCD /
+    // CODEC_PA / etc. causes transitions on the IO expander's INPUT
+    // pins (CHRG_DET, STDBY_DET, VBUS_IN_DET, BAT_DET), each of which
+    // latches the open-drain INT line LOW. EXT0 wake is level-triggered,
+    // so any latched LOW at esp_deep_sleep_start() time = immediate wake
+    // = device reboots right after "Goodbye" instead of sleeping.
+    // (Previous version ran the INT-stabilization loop BEFORE this
+    // power-down, so the cleared INT got re-latched by the power-down
+    // itself and we slept with INT low. Verified 2026-05-21 via serial
+    // log: reset_reason=DEEPSLEEP wake_cause=EXT0 within ~ms of sleep.)
     uint32_t pin_mask_sleep = BSP_PWR_SDCARD | BSP_PWR_CODEC_PA | BSP_PWR_GROVE | BSP_PWR_BAT_ADC | BSP_PWR_LCD | BSP_PWR_AI_CHIP;
     if (io_exp_handle != NULL)
     {
         esp_io_expander_set_level(io_exp_handle, pin_mask_sleep, 0);
     }
 
-    // Final delay to let everything settle
+    // Let peripheral power-down transitions settle before flushing INT.
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Enable wake on button press (IO expander interrupt on GPIO2)
-    // Wake when interrupt line goes LOW (button press triggers IO expander interrupt)
-    esp_sleep_enable_ext0_wakeup(BSP_IO_EXPANDER_INT, 0);
+    // Wait for the INT line to be CONTINUOUSLY HIGH for STABLE_MS straight,
+    // not just instantaneously HIGH on one check. A single check is fooled
+    // by anything re-asserting INT at sub-100 ms cadence — verified
+    // 2026-05-21 with `attempts=0` (instantaneous HIGH) followed by EXT0
+    // wake the moment esp_deep_sleep_start() ran 11 ms later.
+    //
+    // Most likely re-asserters on a USB-tethered test setup: the charge
+    // controller cycling CHRG_DET / STDBY_DET on the IO expander's input
+    // pins as it negotiates with the battery. The PCA9535 has no per-pin
+    // interrupt mask, so the only option is to wait for the inputs to
+    // actually go quiet.
+    //
+    // Algorithm: flush INT, then watch the GPIO line for STABLE_MS. If
+    // it stays HIGH the whole window we're done. If it goes LOW, count
+    // the event, flush again, repeat. Give up after MAX_WAIT_MS — at
+    // that point sleep is risky but trying forever is worse.
+    ESP_LOGI(TAG, "Waiting for INT line to be continuously HIGH for 200ms...");
+    const int STABLE_MS   = 200;   // INT must stay HIGH this long, uninterrupted
+    const int POLL_MS     = 10;    // line-level sample interval
+    const int MAX_WAIT_MS = 5000;  // overall ceiling
+
+    TickType_t start_ticks = xTaskGetTickCount();
+    int flush_count    = 0;
+    int re_assert_count = 0;
+    bool sleep_safe = false;
+
+    while (1)
+    {
+        if (io_exp_handle != NULL)
+        {
+            uint32_t dummy;
+            esp_io_expander_get_level(io_exp_handle, 0xFFFF, &dummy);
+            flush_count++;
+        }
+
+        // Watch for STABLE_MS straight; bail out the moment INT drops.
+        bool dropped = false;
+        int samples = STABLE_MS / POLL_MS;
+        for (int i = 0; i < samples; i++)
+        {
+            vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+            if (gpio_get_level(BSP_IO_EXPANDER_INT) == 0)
+            {
+                dropped = true;
+                re_assert_count++;
+                break;
+            }
+        }
+
+        if (!dropped)
+        {
+            sleep_safe = true;
+            break;
+        }
+
+        uint32_t elapsed_ms = (xTaskGetTickCount() - start_ticks) * portTICK_PERIOD_MS;
+        if (elapsed_ms >= MAX_WAIT_MS)
+        {
+            break;
+        }
+    }
+
+    uint32_t total_wait_ms = (xTaskGetTickCount() - start_ticks) * portTICK_PERIOD_MS;
+    if (sleep_safe)
+    {
+        ESP_LOGI(TAG, "INT stable HIGH (flushes=%d, re-asserts=%d, total=%lums) - ready for sleep",
+                 flush_count, re_assert_count, (unsigned long)total_wait_ms);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "INT never settled after %lums (flushes=%d, re-asserts=%d) - sleep may wake immediately. "
+                      "Unplug USB if testing on-bench; the charge controller is likely fluttering "
+                      "CHRG_DET / STDBY_DET on the IO expander.",
+                 (unsigned long)total_wait_ms, flush_count, re_assert_count);
+    }
+
+    // Dump the IO expander input register state. If a specific INPUT pin
+    // is "stuck" LOW (e.g. CHRG_DET active while battery charging on USB),
+    // we'll see it here — that tells us if the latched INT is being driven
+    // by a real, persistent input condition vs. transient noise.
+    if (io_exp_handle != NULL)
+    {
+        uint32_t input_state = 0;
+        esp_io_expander_get_level(io_exp_handle, 0xFFFF, &input_state);
+        // Active-low signals on inputs: a 0 bit means the corresponding
+        // detect line is asserted. Bits we care about:
+        //   bit 0 = CHRG_DET (low = charging)
+        //   bit 1 = STDBY_DET (low = battery full / standby)
+        //   bit 2 = VBUS_IN_DET (low = USB plugged in)
+        //   bit 3 = KNOB_BTN (low = pressed)
+        //   bit 11 = BAT_DET (low = battery present)
+        ESP_LOGI(TAG, "IO expander input register: 0x%04lx "
+                 "(chrg=%lu stdby=%lu vbus=%lu knob=%lu bat=%lu)",
+                 (unsigned long)(input_state & 0xFFFF),
+                 (unsigned long)((input_state >> 0)  & 1),
+                 (unsigned long)((input_state >> 1)  & 1),
+                 (unsigned long)((input_state >> 2)  & 1),
+                 (unsigned long)((input_state >> 3)  & 1),
+                 (unsigned long)((input_state >> 11) & 1));
+    }
+
+    // Explicitly switch GPIO_NUM_2 (BSP_IO_EXPANDER_INT) from the digital
+    // GPIO subsystem to the RTC GPIO subsystem with input + pull-up
+    // BEFORE configuring EXT0 wake. Doing this through rtc_gpio_init lets
+    // us verify the line level via rtc_gpio_get_level — the digital
+    // gpio_get_level() reading is from the digital subsystem and may not
+    // reflect what the RTC sampler will see at sleep entry. (Previous
+    // attempt: `INT stable HIGH (flushes=1, re-asserts=0)` was reported,
+    // but EXT0 fired the wake 1 ms after esp_deep_sleep_start anyway —
+    // indicating the digital-vs-RTC level read disagreed.)
+    rtc_gpio_init(BSP_IO_EXPANDER_INT);
+    rtc_gpio_set_direction(BSP_IO_EXPANDER_INT, RTC_GPIO_MODE_INPUT_ONLY);
     rtc_gpio_pullup_en(BSP_IO_EXPANDER_INT);
     rtc_gpio_pulldown_dis(BSP_IO_EXPANDER_INT);
+
+    // Let the RTC pull-up settle, then verify the level via the RTC
+    // subsystem. If RTC sees LOW here even though digital saw HIGH for
+    // 200 ms, the issue is the mode switch, not a noisy input. Try a
+    // few flushes if RTC reads LOW.
+    vTaskDelay(pdMS_TO_TICKS(20));
+    int rtc_level = rtc_gpio_get_level(BSP_IO_EXPANDER_INT);
+    int rtc_flush_count = 0;
+    while (rtc_level == 0 && rtc_flush_count < 20)
+    {
+        if (io_exp_handle != NULL)
+        {
+            uint32_t dummy;
+            esp_io_expander_get_level(io_exp_handle, 0xFFFF, &dummy);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+        rtc_level = rtc_gpio_get_level(BSP_IO_EXPANDER_INT);
+        rtc_flush_count++;
+    }
+    int digital_level = gpio_get_level(BSP_IO_EXPANDER_INT);
+    ESP_LOGI(TAG, "Pre-sleep pin state: rtc_level=%d digital_level=%d (rtc_flushes=%d)",
+             rtc_level, digital_level, rtc_flush_count);
+
+    // Configure EXT0 wake source — RTC GPIO mode is now already set above.
+    esp_sleep_enable_ext0_wakeup(BSP_IO_EXPANDER_INT, 0);
 
     ESP_LOGI(TAG, "Entering deep sleep now...");
     esp_deep_sleep_start();
