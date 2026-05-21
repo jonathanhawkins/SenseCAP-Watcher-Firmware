@@ -404,6 +404,17 @@ void ui_disconnecting(void)
 void ui_powering_off(void)
 {
     lvgl_port_lock(0);
+    // Cancel any in-flight disconnect watchdog BEFORE lv_obj_clean — its
+    // callback would otherwise fire during the 500 ms power-off delay and
+    // try to LV_OBJ_FLAG_HIDDEN a now-freed knob_progress_bar pointer
+    // (lv_obj_clean destroys all screen children, freeing the LVGL heap
+    // they occupied; the pointer would dangle until we null it below). Same
+    // logic for stopping the disconnecting anim — it animates hint_label,
+    // which is about to be freed.
+    cancel_disconnect_watchdog();
+    stop_disconnecting_anim();
+    s_disconnecting = false;
+
     // Stop any running animation timers
     if (timer1) {
         lv_timer_del(timer1);
@@ -416,11 +427,15 @@ void ui_powering_off(void)
     s_voice_active = false;
     // Clean screen and show power off message
     lv_obj_clean(lv_scr_act());
-    // Reset pointers since lv_obj_clean destroys all children
+    // Reset pointers since lv_obj_clean destroys all children. knob_progress_bar
+    // was missed in the original list (was added 2026-05-20). Without nulling
+    // it here, any subsequent ensure_knob_progress_bar() would skip creation
+    // and the next access dereferences freed memory.
     status_bar = NULL;
     wifi_status_icon = NULL;
     voice_status_icon = NULL;
     hint_label = NULL;
+    knob_progress_bar = NULL;
     wifi_btn = NULL;
     wifi_btn_label = NULL;
     img = NULL;
@@ -628,6 +643,19 @@ void ui_connection_failed(const char *reason_text)
 
     // Stop the connecting-pulse — we're no longer trying.
     stop_voice_icon_connecting_anim();
+
+    // Cancel any in-flight disconnect watchdog + reset the disconnecting
+    // state. Without this, if a disconnect was in progress when the FAILED
+    // state arrived (e.g. user aborted a stalled CONNECTING via long press,
+    // leave_room ran, then the server signalled FAILED before
+    // ui_show_wifi_button could land), the 3 s watchdog would fire later
+    // and log a misleading "force-clearing stuck Disconnecting... UI state"
+    // even though the device is showing a clear failure overlay.
+    cancel_disconnect_watchdog();
+    if (s_disconnecting) {
+        stop_disconnecting_anim();
+        s_disconnecting = false;
+    }
 
     // Hide the boot scroll label. Keep the listening orb visible — it is the
     // home-screen wallpaper, and the red error label sits on top of it.
