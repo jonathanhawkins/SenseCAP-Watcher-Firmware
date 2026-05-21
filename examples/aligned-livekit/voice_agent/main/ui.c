@@ -408,11 +408,19 @@ void ui_powering_off(void)
     // callback would otherwise fire during the 500 ms power-off delay and
     // try to LV_OBJ_FLAG_HIDDEN a now-freed knob_progress_bar pointer
     // (lv_obj_clean destroys all screen children, freeing the LVGL heap
-    // they occupied; the pointer would dangle until we null it below). Same
-    // logic for stopping the disconnecting anim — it animates hint_label,
-    // which is about to be freed.
+    // they occupied; the pointer would dangle until we null it below).
+    //
+    // Same UAF class applies to two ongoing animations:
+    //   - s_disconnecting_anim drives hint_label opacity (freed below)
+    //   - s_voice_icon_anim drives voice_status_icon opacity (freed below
+    //     via status_bar). Started by ui_wifi_connecting at L322; if the
+    //     user holds for shutdown WHILE still connecting, that anim is
+    //     live when we hit lv_obj_clean.
+    // Stop both before lv_obj_clean to avoid the LVGL anim timer firing
+    // against freed memory during the 500 ms vTaskDelay that follows.
     cancel_disconnect_watchdog();
     stop_disconnecting_anim();
+    stop_voice_icon_connecting_anim();
     s_disconnecting = false;
 
     // Stop any running animation timers
