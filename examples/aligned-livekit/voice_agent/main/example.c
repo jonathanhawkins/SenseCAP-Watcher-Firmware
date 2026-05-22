@@ -519,12 +519,30 @@ void leave_room()
         ESP_LOGW(TAG, "Failed to close room (err=%d), continuing with destroy...", close_err);
     }
 
-    // Match the upstream LiveKit example's leave_room exactly: close, then
-    // destroy back-to-back, no polling. The earlier state-polling loop here
-    // panicked engine_destroy() on 2026-05-18 — `livekit_room_get_state` on
-    // an already-closed handle would return DISCONNECTED immediately, then
-    // destroy hit half-freed engine internals (LoadProhibited, engine.c:1181).
-    // Reference: components/livekit__livekit/examples/voice_agent/main/example.c
+    // Settle delay between close and destroy. close() signals the engine +
+    // peer/GMF audio tasks to stop, but that teardown is ASYNC. Calling
+    // destroy() immediately frees a task's context out from under a
+    // publish-path GMF task that hasn't stopped yet — the audio-encoder task
+    // (aenc_0) resumes after destroy freed it and jumps through a freed
+    // callback pointer into an unmapped flash address:
+    //
+    //   Guru Meditation: Cache disabled but cached memory region accessed
+    //   MMU invalid entry @ 0x43cb8fac  (verified 2026-05-22, meeting end)
+    //
+    // This is MEETING-mode-specific: the mic publishes continuously (the
+    // silent transcriber sends no audio back, so the subscribe path the
+    // 2026-05-18 fix addressed is idle, but the publish/encoder path is hot
+    // and loses the close→destroy race). Voice mode mutes the mic while the
+    // agent speaks, so its encoder is usually idle at teardown.
+    //
+    // We deliberately do NOT poll livekit_room_get_state() — on an
+    // already-closed handle it returns DISCONNECTED immediately, so the old
+    // poll loop fell straight through and destroyed too early (the 2026-05-18
+    // engine_destroy LoadProhibited at engine.c:1181). A fixed delay forces
+    // the wait the broken poll skipped. Teardown is typically ~200 ms; 500 ms
+    // gives margin without a perceptible disconnect lag.
+    vTaskDelay(pdMS_TO_TICKS(500));
+
     ESP_LOGI(TAG, "Destroying LiveKit room handle...");
     livekit_err_t destroy_err = livekit_room_destroy(handle);
     if (destroy_err != LIVEKIT_ERR_NONE)
