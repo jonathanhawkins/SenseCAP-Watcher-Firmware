@@ -33,6 +33,12 @@ static char g_livekit_token[2048] = {0};
 static char g_room_name[128] = {0};
 static char g_voice_provider[32] = "xai";
 static char g_session_id[64] = {0};
+// Connect mode sent to the backend: "voice" (default) or "meeting" (silent
+// live-meeting transcription). Set via aligned_set_connect_mode() before
+// aligned_get_livekit_credentials(). meeting_id is returned by the backend
+// only for mode="meeting".
+static char g_connect_mode[16] = "voice";
+static char g_meeting_id[64] = {0};
 
 // Connection state tracking
 static bool g_aligned_connected = false;
@@ -274,9 +280,13 @@ esp_err_t aligned_get_livekit_credentials(void) {
     ESP_LOGI(TAG, "Requesting LiveKit credentials from Aligned API...");
     ESP_LOGI(TAG, "URL: %s", url);
 
+    // Reset meeting id; only repopulated for mode="meeting" responses.
+    g_meeting_id[0] = '\0';
+
     // Prepare request body
     cJSON *request = cJSON_CreateObject();
     cJSON_AddStringToObject(request, "device_token", g_aligned_device_token);
+    cJSON_AddStringToObject(request, "mode", g_connect_mode);
     char *request_body = cJSON_PrintUnformatted(request);
     cJSON_Delete(request);
 
@@ -364,6 +374,12 @@ esp_err_t aligned_get_livekit_credentials(void) {
         strncpy(g_session_id, session_id->valuestring, sizeof(g_session_id) - 1);
         g_session_id[sizeof(g_session_id) - 1] = '\0';
     }
+    // meeting_id is present only for mode="meeting" responses.
+    cJSON *meeting_id = cJSON_GetObjectItem(response, "meeting_id");
+    if (meeting_id && cJSON_IsString(meeting_id)) {
+        strncpy(g_meeting_id, meeting_id->valuestring, sizeof(g_meeting_id) - 1);
+        g_meeting_id[sizeof(g_meeting_id) - 1] = '\0';
+    }
 
     cJSON_Delete(response);
 
@@ -405,6 +421,26 @@ const char* aligned_get_room_name(void) {
  */
 const char* aligned_get_session_id(void) {
     return g_session_id;
+}
+
+/**
+ * Set the connect mode for the next aligned_get_livekit_credentials() call.
+ * "voice" (default) or "meeting" (silent live-meeting transcription).
+ */
+void aligned_set_connect_mode(const char *mode) {
+    if (mode == NULL || strlen(mode) == 0) {
+        mode = "voice";
+    }
+    strncpy(g_connect_mode, mode, sizeof(g_connect_mode) - 1);
+    g_connect_mode[sizeof(g_connect_mode) - 1] = '\0';
+}
+
+/**
+ * Get the meeting id returned by the backend for a mode="meeting" connect.
+ * Empty string if the last connect was not a meeting.
+ */
+const char* aligned_get_meeting_id(void) {
+    return g_meeting_id;
 }
 
 /**

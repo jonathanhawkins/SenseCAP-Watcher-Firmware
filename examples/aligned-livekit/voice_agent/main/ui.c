@@ -29,6 +29,24 @@ static bool s_disconnecting = false;       // Mid-disconnect — keep "Disconnec
 static bool s_disconnecting_anim_active = false;
 static lv_anim_t s_disconnecting_anim;
 
+// Live-meeting UI widgets. These overlay the home orb (kept as wallpaper)
+// during a silent transcription session. See ui_meeting_start/end.
+static lv_obj_t *meeting_btn = NULL;               // Home-screen meeting button (mic icon)
+static lv_obj_t *meeting_btn_icon = NULL;          // mic image child of meeting_btn
+static lv_obj_t *meeting_rec_label = NULL;         // "● REC" indicator (opacity-pulsed)
+static lv_obj_t *meeting_transcript_label = NULL;  // latest transcript line(s)
+static lv_obj_t *meeting_coach_card = NULL;        // coach suggestion card
+static lv_obj_t *meeting_coach_label = NULL;
+static lv_obj_t *meeting_end_btn = NULL;           // "End" button (bottom)
+static lv_obj_t *meeting_end_label = NULL;
+static lv_timer_t *meeting_coach_timer = NULL;     // one-shot auto-hide for coach card
+static lv_anim_t s_rec_anim;
+static bool s_rec_anim_active = false;
+static bool s_meeting_ui_active = false;           // gates wifi_check_timer fighting us
+// Rolling last-two transcript lines (older, newer) for the on-screen display.
+static char s_tx_line_old[160] = {0};
+static char s_tx_line_new[160] = {0};
+
 // Forward declarations
 static void wifi_btn_event_cb(lv_event_t *e);
 static void wifi_check_timer_cb(lv_timer_t *timer);
@@ -38,6 +56,10 @@ static void create_status_bar(void);
 static void update_status_bar(void);
 static void create_hint_label(void);
 static void update_hint_label(void);
+static void create_meeting_button(void);
+static void meeting_btn_event_cb(lv_event_t *e);
+static void meeting_end_btn_event_cb(lv_event_t *e);
+static void show_home_chrome_locked(void);  // home buttons/status bar; assumes LVGL lock held
 
 // Assume that the images have been converted to C arrays and included
 extern const lv_img_dsc_t speaking_A;
@@ -51,6 +73,9 @@ extern const lv_img_dsc_t listening_B;
 extern const lv_img_dsc_t listening_C;
 extern const lv_img_dsc_t listening_D;
 extern const lv_img_dsc_t listening_E;
+
+// White microphone glyph for the Live Meeting button (main/mic_icon.c).
+extern const lv_img_dsc_t mic_icon;
 
 // Image arrays
 static const lv_img_dsc_t *speaking_images[] = {
@@ -936,6 +961,11 @@ static void wifi_btn_event_cb(lv_event_t *e)
  */
 static void wifi_check_timer_cb(lv_timer_t *timer)
 {
+    // During a live meeting the home buttons are intentionally hidden — don't
+    // let the visibility refresh un-hide them.
+    if (s_meeting_ui_active) {
+        return;
+    }
     update_wifi_button_visibility();
     update_status_bar();
     // Don't call update_hint_label() here — its s_voice_active gating would
@@ -1034,15 +1064,20 @@ static void update_wifi_button_visibility(void)
     }
 }
 
-/**
- * @brief Initialize and show the WiFi button (call after ui_init or ui_listening)
- */
-void ui_show_wifi_button(void)
+// Body of ui_show_wifi_button, assuming the LVGL lock is already held. Split
+// out so ui_meeting_end() can restore the home chrome without re-locking the
+// (non-recursive) port mutex.
+static void show_home_chrome_locked(void)
 {
-    lvgl_port_lock(0);
+    s_meeting_ui_active = false;
+
+    // Restore the Aligned orb wallpaper (hidden during a meeting for readability).
+    if (img) lv_obj_clear_flag(img, LV_OBJ_FLAG_HIDDEN);
 
     create_wifi_button();
     update_wifi_button_visibility();
+    create_meeting_button();
+    if (meeting_btn) lv_obj_clear_flag(meeting_btn, LV_OBJ_FLAG_HIDDEN);
 
     // Create status bar (always visible when WiFi button system is active)
     create_status_bar();
@@ -1068,7 +1103,15 @@ void ui_show_wifi_button(void)
         wifi_check_timer = lv_timer_create(wifi_check_timer_cb, WIFI_CHECK_INTERVAL_MS, NULL);
         lv_timer_set_repeat_count(wifi_check_timer, -1); // Repeat forever
     }
+}
 
+/**
+ * @brief Initialize and show the WiFi button (call after ui_init or ui_listening)
+ */
+void ui_show_wifi_button(void)
+{
+    lvgl_port_lock(0);
+    show_home_chrome_locked();
     lvgl_port_unlock();
 }
 
@@ -1089,6 +1132,308 @@ void ui_hide_wifi_button(void)
         wifi_btn = NULL;
         wifi_btn_label = NULL;  // Child of wifi_btn, freed by lv_obj_del
     }
+
+    lvgl_port_unlock();
+}
+
+//=============================================================================
+// Live Meeting (silent transcription) UI
+//=============================================================================
+
+static void meeting_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Live Meeting button pressed");
+    // start_meeting() does blocking HTTP + room setup — defer to button_task so
+    // we don't stall the LVGL render task. See example.c::service_meeting_requests.
+    request_start_meeting();
+}
+
+static void meeting_end_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Meeting End button pressed");
+    request_stop_meeting();
+}
+
+/**
+ * @brief Create the "Live Meeting" button on the home screen (far left).
+ *
+ * Placed at LEFT_MID where the round screen is full-width (no edge clipping).
+ * Tapping it starts a silent live-meeting transcription session.
+ */
+static void create_meeting_button(void)
+{
+    if (meeting_btn != NULL) {
+        return;
+    }
+    meeting_btn = lv_btn_create(lv_scr_act());
+    if (meeting_btn == NULL) {
+        ESP_LOGE(TAG, "Failed to create Live Meeting button");
+        return;
+    }
+    // Round, icon-only mic button at center-right, with the Aligned-logo
+    // orange→cyan gradient (colors sampled from ALIGNED_LOGO_ONLY.webp).
+    lv_obj_set_size(meeting_btn, 58, 58);
+    lv_obj_align(meeting_btn, LV_ALIGN_RIGHT_MID, -16, 0);
+    lv_obj_set_style_radius(meeting_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(meeting_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(meeting_btn, lv_color_hex(0xF0824D), 0);       // logo orange (start)
+    lv_obj_set_style_bg_grad_color(meeting_btn, lv_color_hex(0x45C2DA), 0);  // logo cyan (end)
+    lv_obj_set_style_bg_grad_dir(meeting_btn, LV_GRAD_DIR_HOR, 0);
+    lv_obj_set_style_border_width(meeting_btn, 0, 0);
+    lv_obj_set_style_shadow_width(meeting_btn, 8, 0);
+    lv_obj_set_style_shadow_color(meeting_btn, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(meeting_btn, LV_OPA_30, 0);
+    // Pressed: darken both gradient stops slightly for tactile feedback.
+    lv_obj_set_style_bg_color(meeting_btn, lv_color_hex(0xD06A38), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_grad_color(meeting_btn, lv_color_hex(0x35A6BC), LV_STATE_PRESSED);
+
+    // White microphone icon (custom image — LVGL 8.4 has no stock mic glyph).
+    meeting_btn_icon = lv_img_create(meeting_btn);
+    if (meeting_btn_icon) {
+        lv_img_set_src(meeting_btn_icon, &mic_icon);
+        lv_obj_center(meeting_btn_icon);
+    }
+
+    lv_obj_add_event_cb(meeting_btn, meeting_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    ESP_LOGI(TAG, "Live Meeting button created");
+}
+
+static void stop_rec_anim(void)
+{
+    if (s_rec_anim_active && meeting_rec_label) {
+        lv_anim_del(meeting_rec_label, NULL);
+        lv_obj_set_style_opa(meeting_rec_label, LV_OPA_COVER, LV_PART_MAIN);
+    }
+    s_rec_anim_active = false;
+}
+
+static void coach_card_hide(void)
+{
+    if (meeting_coach_card) {
+        lv_obj_add_flag(meeting_coach_card, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void meeting_coach_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    coach_card_hide();
+    // repeat_count was set to 1 → LVGL auto-deletes this timer after the cb.
+    meeting_coach_timer = NULL;
+}
+
+static void coach_card_tap_cb(lv_event_t *e)
+{
+    (void)e;
+    coach_card_hide();
+    if (meeting_coach_timer) {
+        lv_timer_del(meeting_coach_timer);
+        meeting_coach_timer = NULL;
+    }
+}
+
+void ui_meeting_start(void)
+{
+    lvgl_port_lock(0);
+    s_meeting_ui_active = true;
+
+    // Stop the WiFi-button poll timer so it doesn't un-hide the home buttons
+    // (update_wifi_button_visibility clears the HIDDEN flag every 2 s).
+    if (wifi_check_timer) {
+        lv_timer_del(wifi_check_timer);
+        wifi_check_timer = NULL;
+    }
+
+    // Readability: dark screen background + HIDE the Aligned orb so the white
+    // transcript/coach text isn't competing with the logo. Restored on end.
+    // (Hide, never lv_obj_clean — the orb widget is reused — per watcher-ui.md.)
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x0A0A0B), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, LV_PART_MAIN);
+    if (img) lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
+
+    // Hide idle home chrome.
+    if (wifi_btn)      lv_obj_add_flag(wifi_btn, LV_OBJ_FLAG_HIDDEN);
+    if (meeting_btn)   lv_obj_add_flag(meeting_btn, LV_OBJ_FLAG_HIDDEN);
+    if (hint_label)    lv_obj_add_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
+    if (label)         lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+    if (failure_label) lv_obj_add_flag(failure_label, LV_OBJ_FLAG_HIDDEN);
+    if (failure_hint)  lv_obj_add_flag(failure_hint,  LV_OBJ_FLAG_HIDDEN);
+
+    // Reset rolling transcript lines.
+    s_tx_line_old[0] = '\0';
+    s_tx_line_new[0] = '\0';
+
+    // "REC" indicator (static label + opacity pulse — tear-safe per watcher-ui.md).
+    if (meeting_rec_label == NULL) {
+        meeting_rec_label = lv_label_create(lv_scr_act());
+    }
+    if (meeting_rec_label) {
+        lv_label_set_text(meeting_rec_label, LV_SYMBOL_AUDIO " REC");
+        lv_obj_set_style_text_color(meeting_rec_label, lv_color_hex(0xE53935), 0);
+        lv_obj_set_style_text_font(meeting_rec_label, &lv_font_montserrat_14, 0);
+        lv_obj_align(meeting_rec_label, LV_ALIGN_TOP_MID, 0, 56);
+        lv_obj_clear_flag(meeting_rec_label, LV_OBJ_FLAG_HIDDEN);
+        // Clear any existing animation first so a repeated ui_meeting_start
+        // (CONNECTED can fire more than once) doesn't stack infinite anims (M5).
+        lv_anim_del(meeting_rec_label, NULL);
+        lv_anim_init(&s_rec_anim);
+        lv_anim_set_var(&s_rec_anim, meeting_rec_label);
+        lv_anim_set_exec_cb(&s_rec_anim, disconnecting_label_opa_cb);
+        lv_anim_set_values(&s_rec_anim, LV_OPA_COVER, LV_OPA_40);
+        lv_anim_set_time(&s_rec_anim, 700);
+        lv_anim_set_playback_time(&s_rec_anim, 700);
+        lv_anim_set_repeat_count(&s_rec_anim, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_start(&s_rec_anim);
+        s_rec_anim_active = true;
+    }
+
+    // Transcript label (latest lines, centered, wrapped — no spatial motion).
+    if (meeting_transcript_label == NULL) {
+        meeting_transcript_label = lv_label_create(lv_scr_act());
+    }
+    if (meeting_transcript_label) {
+        lv_label_set_long_mode(meeting_transcript_label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(meeting_transcript_label, 300);
+        lv_obj_set_style_text_align(meeting_transcript_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(meeting_transcript_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(meeting_transcript_label, &lv_font_montserrat_14, 0);
+        lv_label_set_text(meeting_transcript_label, "Listening...");
+        lv_obj_align(meeting_transcript_label, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(meeting_transcript_label, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // "End" button (bottom center).
+    if (meeting_end_btn == NULL) {
+        meeting_end_btn = lv_btn_create(lv_scr_act());
+        if (meeting_end_btn) {
+            lv_obj_set_size(meeting_end_btn, 120, 42);
+            lv_obj_align(meeting_end_btn, LV_ALIGN_BOTTOM_MID, 0, -30);
+            lv_obj_set_style_bg_color(meeting_end_btn, lv_color_hex(0x424242), 0);
+            lv_obj_set_style_bg_opa(meeting_end_btn, LV_OPA_90, 0);
+            lv_obj_set_style_radius(meeting_end_btn, 21, 0);
+            lv_obj_set_style_bg_color(meeting_end_btn, lv_color_hex(0x616161), LV_STATE_PRESSED);
+            meeting_end_label = lv_label_create(meeting_end_btn);
+            lv_label_set_text(meeting_end_label, LV_SYMBOL_STOP " End");
+            lv_obj_set_style_text_font(meeting_end_label, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(meeting_end_label, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_center(meeting_end_label);
+            lv_obj_add_event_cb(meeting_end_btn, meeting_end_btn_event_cb, LV_EVENT_CLICKED, NULL);
+        }
+    } else {
+        lv_obj_clear_flag(meeting_end_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Status bar stays; orb stays as background beneath everything.
+    create_status_bar();
+    update_status_bar();
+    if (img)                       lv_obj_move_background(img);
+    if (status_bar)                lv_obj_move_foreground(status_bar);
+    if (meeting_rec_label)         lv_obj_move_foreground(meeting_rec_label);
+    if (meeting_transcript_label)  lv_obj_move_foreground(meeting_transcript_label);
+    if (meeting_end_btn)           lv_obj_move_foreground(meeting_end_btn);
+
+    lvgl_port_unlock();
+}
+
+void ui_meeting_transcript_line(const char *text)
+{
+    if (text == NULL || text[0] == '\0') {
+        return;
+    }
+    lvgl_port_lock(0);
+    if (meeting_transcript_label) {
+        // Roll: previous newer line becomes the older line, new text becomes newer.
+        strncpy(s_tx_line_old, s_tx_line_new, sizeof(s_tx_line_old) - 1);
+        s_tx_line_old[sizeof(s_tx_line_old) - 1] = '\0';
+        strncpy(s_tx_line_new, text, sizeof(s_tx_line_new) - 1);
+        s_tx_line_new[sizeof(s_tx_line_new) - 1] = '\0';
+
+        char combined[332];
+        if (s_tx_line_old[0] != '\0') {
+            snprintf(combined, sizeof(combined), "%s\n%s", s_tx_line_old, s_tx_line_new);
+        } else {
+            snprintf(combined, sizeof(combined), "%s", s_tx_line_new);
+        }
+        lv_label_set_text(meeting_transcript_label, combined);
+
+        // Diagnostic for "stops translating when full": watch the LVGL heap
+        // (32 KB pool). If free trends toward 0, the freeze is heap exhaustion.
+        static int s_tx_count = 0;
+        if ((++s_tx_count % 5) == 0) {
+            lv_mem_monitor_t mon;
+            lv_mem_monitor(&mon);
+            ESP_LOGI(TAG, "[meeting] tx#%d lvgl_free=%u used=%d%% frag=%d%%",
+                     s_tx_count, (unsigned)mon.free_size, (int)mon.used_pct, (int)mon.frag_pct);
+        }
+    }
+    lvgl_port_unlock();
+}
+
+void ui_meeting_coach_card(const char *text)
+{
+    if (text == NULL || text[0] == '\0') {
+        return;
+    }
+    lvgl_port_lock(0);
+
+    if (meeting_coach_card == NULL) {
+        meeting_coach_card = lv_obj_create(lv_scr_act());
+        if (meeting_coach_card) {
+            lv_obj_set_size(meeting_coach_card, 320, LV_SIZE_CONTENT);
+            lv_obj_align(meeting_coach_card, LV_ALIGN_BOTTOM_MID, 0, -82);
+            lv_obj_set_style_bg_color(meeting_coach_card, lv_color_hex(0x1E88E5), 0);
+            lv_obj_set_style_bg_opa(meeting_coach_card, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(meeting_coach_card, 14, 0);
+            lv_obj_set_style_pad_all(meeting_coach_card, 10, 0);
+            lv_obj_set_style_border_width(meeting_coach_card, 0, 0);
+            lv_obj_clear_flag(meeting_coach_card, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_event_cb(meeting_coach_card, coach_card_tap_cb, LV_EVENT_CLICKED, NULL);
+
+            meeting_coach_label = lv_label_create(meeting_coach_card);
+            lv_label_set_long_mode(meeting_coach_label, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(meeting_coach_label, 296);
+            lv_obj_set_style_text_color(meeting_coach_label, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_text_font(meeting_coach_label, &lv_font_montserrat_14, 0);
+        }
+    }
+    if (meeting_coach_card && meeting_coach_label) {
+        lv_label_set_text(meeting_coach_label, text);
+        lv_obj_clear_flag(meeting_coach_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(meeting_coach_card);
+
+        // Auto-hide after 12 s. Replace any pending timer.
+        if (meeting_coach_timer) {
+            lv_timer_del(meeting_coach_timer);
+            meeting_coach_timer = NULL;
+        }
+        meeting_coach_timer = lv_timer_create(meeting_coach_timer_cb, 12000, NULL);
+        if (meeting_coach_timer) {
+            lv_timer_set_repeat_count(meeting_coach_timer, 1);
+        }
+    }
+
+    lvgl_port_unlock();
+}
+
+void ui_meeting_end(void)
+{
+    lvgl_port_lock(0);
+
+    stop_rec_anim();
+    if (meeting_coach_timer) {
+        lv_timer_del(meeting_coach_timer);
+        meeting_coach_timer = NULL;
+    }
+    if (meeting_rec_label)        lv_obj_add_flag(meeting_rec_label, LV_OBJ_FLAG_HIDDEN);
+    if (meeting_transcript_label) lv_obj_add_flag(meeting_transcript_label, LV_OBJ_FLAG_HIDDEN);
+    if (meeting_coach_card)       lv_obj_add_flag(meeting_coach_card, LV_OBJ_FLAG_HIDDEN);
+    if (meeting_end_btn)          lv_obj_add_flag(meeting_end_btn, LV_OBJ_FLAG_HIDDEN);
+
+    // Restore the idle home screen (re-shows WiFi + Live Meeting buttons,
+    // restarts the WiFi poll timer). Reuses the lock-free helper.
+    show_home_chrome_locked();
 
     lvgl_port_unlock();
 }

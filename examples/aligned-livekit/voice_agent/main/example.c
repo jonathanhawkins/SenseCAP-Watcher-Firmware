@@ -5,6 +5,7 @@
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
+#include "freertos/task.h"
 #include "livekit.h"
 #include "livekit_sandbox.h"
 #include "media.h"
@@ -18,6 +19,18 @@ static const char *TAG = "livekit_example";
 static livekit_room_handle_t room_handle;
 static bool agent_joined = false;
 static bool s_leaving_room = false;  /* Re-entry guard for leave_room() */
+// Live-meeting mode: silent transcription session (vs. conversational voice).
+// Set at connect time (after stale-handle cleanup) and read by the state/data
+// callbacks to drive the meeting UI instead of the voice listening orb.
+static bool s_meeting_mode = false;
+
+// Touch-button → worker-task handoff. The "Live Meeting" / "End" buttons run
+// their click callbacks in the LVGL render task, but start_meeting()/stop_meeting()
+// do blocking HTTP and a room teardown — running those in the LVGL task would
+// freeze rendering and trip the watchdog. So the callbacks just set a flag and
+// button_task (a normal FreeRTOS task) services it via service_meeting_requests().
+static volatile bool s_req_start_meeting = false;
+static volatile bool s_req_stop_meeting = false;
 
 // Agent-join watchdog. After CONNECTED state fires we start a timer; if no
 // agent has joined the room by the time it elapses, surface "Agent
@@ -27,6 +40,12 @@ static bool s_leaving_room = false;  /* Re-entry guard for leave_room() */
 #define AGENT_JOIN_TIMEOUT_MS 8000
 static TimerHandle_t s_agent_join_timer = NULL;
 static bool s_agent_join_failed = false;
+// Guards s_agent_join_timer. start/cancel run from multiple tasks (button_task
+// via leave_room AND the LiveKit on_state_changed callback). Without this,
+// two concurrent cancels both pass the NULL-check and call xTimerDelete on the
+// same handle → double-free corrupts the FreeRTOS timer list (uxListRemove
+// StoreProhibited crash, seen on meeting end 2026-05-22).
+static portMUX_TYPE s_watchdog_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void agent_join_timer_cb(TimerHandle_t t)
 {
@@ -48,31 +67,47 @@ static void agent_join_timer_cb(TimerHandle_t t)
 
 static void start_agent_join_timer(void)
 {
-    if (s_agent_join_timer != NULL) {
-        xTimerStop(s_agent_join_timer, 0);
-        xTimerDelete(s_agent_join_timer, 0);
-        s_agent_join_timer = NULL;
+    // Atomically take ownership of any existing timer, then delete it OUTSIDE
+    // the critical section (xTimer* calls queue commands and must not run in a
+    // critical section). See s_watchdog_mux.
+    TimerHandle_t old;
+    taskENTER_CRITICAL(&s_watchdog_mux);
+    old = s_agent_join_timer;
+    s_agent_join_timer = NULL;
+    taskEXIT_CRITICAL(&s_watchdog_mux);
+    if (old != NULL) {
+        xTimerStop(old, 0);
+        xTimerDelete(old, 0);
     }
-    s_agent_join_timer = xTimerCreate(
+
+    TimerHandle_t t = xTimerCreate(
         "agent_join",
         pdMS_TO_TICKS(AGENT_JOIN_TIMEOUT_MS),
         pdFALSE,  // one-shot
         NULL,
         agent_join_timer_cb
     );
-    if (s_agent_join_timer && xTimerStart(s_agent_join_timer, 0) != pdPASS) {
+    if (t && xTimerStart(t, 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to start agent-join watchdog");
-        xTimerDelete(s_agent_join_timer, 0);
-        s_agent_join_timer = NULL;
+        xTimerDelete(t, 0);
+        t = NULL;
     }
+    taskENTER_CRITICAL(&s_watchdog_mux);
+    s_agent_join_timer = t;
+    taskEXIT_CRITICAL(&s_watchdog_mux);
 }
 
 static void cancel_agent_join_timer(void)
 {
-    if (s_agent_join_timer != NULL) {
-        xTimerStop(s_agent_join_timer, 0);
-        xTimerDelete(s_agent_join_timer, 0);
-        s_agent_join_timer = NULL;
+    // Atomically claim the handle so only ONE concurrent caller deletes it.
+    TimerHandle_t t;
+    taskENTER_CRITICAL(&s_watchdog_mux);
+    t = s_agent_join_timer;
+    s_agent_join_timer = NULL;
+    taskEXIT_CRITICAL(&s_watchdog_mux);
+    if (t != NULL) {
+        xTimerStop(t, 0);
+        xTimerDelete(t, 0);
     }
 }
 
@@ -106,10 +141,16 @@ static void on_state_changed(livekit_connection_state_t state, void *ctx)
     {
         case LIVEKIT_CONNECTION_STATE_CONNECTED:
             ESP_LOGI(TAG, "✅ Connected to LiveKit room!");
-            ui_listening();  // Show listening animation - ready for voice
-            ui_set_voice_active(true);  // Update status bar: voice active
-            // Start the agent-join watchdog. If no agent participant joins
-            // within AGENT_JOIN_TIMEOUT_MS we'll surface "Agent unavailable".
+            if (s_meeting_mode) {
+                // Silent meeting: show the recording/transcript screen instead
+                // of the conversational listening orb + "hold to disconnect".
+                ui_meeting_start();
+            } else {
+                ui_listening();  // Show listening animation - ready for voice
+                ui_set_voice_active(true);  // Update status bar: voice active
+            }
+            // Start the agent-join watchdog. The meeting transcriber also joins
+            // as an agent participant, so the watchdog applies to both modes.
             start_agent_join_timer();
             break;
         case LIVEKIT_CONNECTION_STATE_CONNECTING:
@@ -119,7 +160,12 @@ static void on_state_changed(livekit_connection_state_t state, void *ctx)
         case LIVEKIT_CONNECTION_STATE_DISCONNECTED:
             cancel_agent_join_timer();
             ui_set_voice_active(false);  // Update status bar: voice inactive
-            ui_disconnecting();  // Show disconnected state
+            if (s_meeting_mode) {
+                // End the meeting screen and return to the home wallpaper.
+                ui_meeting_end();
+            } else {
+                ui_disconnecting();  // Show disconnected state
+            }
             break;
         case LIVEKIT_CONNECTION_STATE_FAILED:
             ESP_LOGE(TAG, "❌ Connection failed!");
@@ -190,17 +236,67 @@ static void on_data_received(const livekit_data_received_t *data, void *ctx)
     if (data == NULL || data->topic == NULL || data->payload.bytes == NULL) {
         return;
     }
-    if (strcmp(data->topic, "agent_state") != 0) {
+
+    if (strcmp(data->topic, "agent_state") == 0) {
+        // Payload is a short ASCII string ("speaking" / "listening" / "thinking" / "idle").
+        // We only mute on the literal "speaking" transition — every other state
+        // (listening / thinking / idle) means the agent isn't producing audio
+        // so the mic should be live to capture the user. In meeting mode the
+        // transcriber never speaks, so this leaves the mic live throughout.
+        const uint8_t *p = data->payload.bytes;
+        size_t n = data->payload.size;
+        bool speaking = (n == 8 && memcmp(p, "speaking", 8) == 0);
+        media_set_mic_muted(speaking);
         return;
     }
-    // Payload is a short ASCII string ("speaking" / "listening" / "thinking" / "idle").
-    // We only mute on the literal "speaking" transition — every other state
-    // (listening / thinking / idle) means the agent isn't producing audio
-    // so the mic should be live to capture the user.
-    const uint8_t *p = data->payload.bytes;
+
+    // Meeting-mode data channels: transcript lines (topic "transcription",
+    // type "meeting_transcript") and coach cards (topic "coach"). Ignored
+    // outside a meeting so voice-mode "transcription" packets (memory tool
+    // debug events) don't render anything.
+    if (!s_meeting_mode) {
+        return;
+    }
+    bool is_transcript = (strcmp(data->topic, "transcription") == 0);
+    bool is_coach = (strcmp(data->topic, "coach") == 0);
+    if (!is_transcript && !is_coach) {
+        return;
+    }
+
+    // Copy payload to a bounded, null-terminated buffer for cJSON.
     size_t n = data->payload.size;
-    bool speaking = (n == 8 && memcmp(p, "speaking", 8) == 0);
-    media_set_mic_muted(speaking);
+    if (n == 0) return;
+    if (n > 768) {
+        n = 768;  // cap — transcript lines / coach text are short
+        // Back off to a UTF-8 codepoint boundary so we don't truncate mid-
+        // sequence (would render a tofu glyph). Continuation bytes are 10xxxxxx (L1).
+        const uint8_t *pb = (const uint8_t *)data->payload.bytes;
+        while (n > 0 && (pb[n] & 0xC0) == 0x80) n--;
+    }
+    char buf[769];
+    memcpy(buf, data->payload.bytes, n);
+    buf[n] = '\0';
+
+    cJSON *obj = cJSON_Parse(buf);
+    if (obj == NULL) {
+        return;
+    }
+    cJSON *type = cJSON_GetObjectItem(obj, "type");
+    const char *type_str = (type && cJSON_IsString(type)) ? type->valuestring : "";
+
+    if (is_transcript && strcmp(type_str, "meeting_transcript") == 0) {
+        cJSON *text = cJSON_GetObjectItem(obj, "text");
+        if (text && cJSON_IsString(text) && strlen(text->valuestring) > 0) {
+            ui_meeting_transcript_line(text->valuestring);
+        }
+    } else if (is_coach && strcmp(type_str, "coach_suggestion") == 0) {
+        cJSON *display = cJSON_GetObjectItem(obj, "display_text");
+        if (display && cJSON_IsString(display) && strlen(display->valuestring) > 0) {
+            ui_meeting_coach_card(display->valuestring);
+        }
+    }
+
+    cJSON_Delete(obj);
 }
 
 /// Invoked by a remote participant to set the state of an on-board LED.
@@ -226,7 +322,7 @@ static void get_cpu_temp(const livekit_rpc_invocation_t *invocation, void *ctx)
     livekit_rpc_return_ok(temp_string);
 }
 
-void join_room()
+static void connect_room_internal(bool meeting)
 {
     // Show "Connecting..." immediately. The HTTP credentials fetch below
     // takes ~1–3 s, and LiveKit's CONNECTING state callback only fires
@@ -283,6 +379,12 @@ void join_room()
             }
         }
     }
+
+    // Latch the session mode AFTER any stale-handle cleanup above (the cleanup
+    // path calls leave_room(), which resets s_meeting_mode). Tell the backend
+    // which mode to connect in BEFORE the credentials fetch below.
+    s_meeting_mode = meeting;
+    aligned_set_connect_mode(meeting ? "meeting" : "voice");
 
     // Reinitialize media if it was cleaned up (e.g., after leaving a room)
     if (media_get_capturer() == NULL || media_get_renderer() == NULL)
@@ -350,6 +452,18 @@ void join_room()
         leave_room();
     }
     // On success, on_state_changed will fire with CONNECTING then CONNECTED.
+}
+
+void join_room()
+{
+    // Conversational voice session (the default knob single-click action).
+    connect_room_internal(false);
+}
+
+void start_meeting()
+{
+    // Silent live-meeting transcription session (Live Meeting button).
+    connect_room_internal(true);
 }
 
 void leave_room()
@@ -420,6 +534,7 @@ void leave_room()
 
     agent_joined = false;
     s_leaving_room = false;
+    s_meeting_mode = false;  // next session defaults to voice unless start_meeting() sets it
 
     // Restore WiFi power-save so the device doesn't burn battery while
     // idle waiting for the next knob press. Matches the IDF default that
@@ -446,4 +561,51 @@ bool room_is_active(void)
     return st == LIVEKIT_CONNECTION_STATE_CONNECTED ||
            st == LIVEKIT_CONNECTION_STATE_CONNECTING ||
            st == LIVEKIT_CONNECTION_STATE_RECONNECTING;
+}
+
+bool meeting_is_active(void)
+{
+    return s_meeting_mode && room_is_active();
+}
+
+void stop_meeting(void)
+{
+    if (!room_is_active())
+    {
+        return;
+    }
+    ESP_LOGI(TAG, "Ending live meeting");
+    ui_meeting_end();   // hide transcript/coach UI, restore home wallpaper
+    leave_room();       // server-side session close triggers transcript finalize
+    // Brief pause so the end transition is visible, then ensure home chrome.
+    vTaskDelay(pdMS_TO_TICKS(300));
+    ui_show_wifi_button();
+}
+
+// Called from the LVGL touch callbacks — must be cheap and non-blocking.
+void request_start_meeting(void) { s_req_start_meeting = true; }
+void request_stop_meeting(void)  { s_req_stop_meeting = true; }
+
+// Called from button_task (a normal FreeRTOS task) to perform the deferred,
+// blocking start/stop work off the LVGL render task.
+void service_meeting_requests(void)
+{
+    if (s_req_start_meeting)
+    {
+        s_req_start_meeting = false;
+        if (!room_is_active())
+        {
+            ESP_LOGI(TAG, "Live Meeting button → starting meeting");
+            start_meeting();
+        }
+    }
+    if (s_req_stop_meeting)
+    {
+        s_req_stop_meeting = false;
+        if (room_is_active())
+        {
+            ESP_LOGI(TAG, "End button → stopping meeting");
+            stop_meeting();
+        }
+    }
 }

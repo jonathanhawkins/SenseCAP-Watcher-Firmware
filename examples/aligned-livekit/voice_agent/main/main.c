@@ -56,6 +56,15 @@ static void handle_long_release(void)
         return;
     }
 
+    // A held knob during a live meeting ends the meeting (same as the End
+    // button) so the server-side transcript is finalized cleanly.
+    if (meeting_is_active())
+    {
+        ESP_LOGI(TAG, "Button hold - ending live meeting");
+        stop_meeting();
+        return;
+    }
+
     ESP_LOGI(TAG, "Button hold - leaving LiveKit room");
     ui_disconnecting();
     leave_room();
@@ -119,6 +128,9 @@ static void button_task(void *arg)
 
     for (;;)
     {
+        // Service deferred Live Meeting / End button taps off the LVGL task.
+        service_meeting_requests();
+
         bool pressed = board_is_knob_pressed();
         TickType_t now = xTaskGetTickCount();
 

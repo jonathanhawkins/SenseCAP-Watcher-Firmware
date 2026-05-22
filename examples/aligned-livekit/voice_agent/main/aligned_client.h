@@ -101,6 +101,19 @@ const char* aligned_get_livekit_token(void);
 const char* aligned_get_participant_token(void);
 
 /**
+ * Set the connect mode for the next aligned_get_livekit_credentials() call.
+ * "voice" (default conversational agent) or "meeting" (silent live-meeting
+ * transcription). Persists until changed.
+ */
+void aligned_set_connect_mode(const char *mode);
+
+/**
+ * Get the meeting id returned by the backend for a mode="meeting" connect.
+ * Returns "" if the last connect was not a meeting.
+ */
+const char* aligned_get_meeting_id(void);
+
+/**
  * Get LiveKit room name
  */
 const char* aligned_get_room_name(void);

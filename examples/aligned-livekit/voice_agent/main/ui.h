@@ -13,6 +13,42 @@ void ui_disconnecting(void);
 void ui_powering_off(void);
 
 /**
+ * @brief Enter the live-meeting (silent transcription) screen.
+ *
+ * Keeps the home orb as the wallpaper but overlays a recording indicator,
+ * a latest-transcript line, and an "End" button. Hides the idle home buttons.
+ * Called on CONNECTED when the session is a meeting (see example.c).
+ */
+void ui_meeting_start(void);
+
+/**
+ * @brief Update the on-screen transcript with the latest finalized line.
+ *
+ * Shows the most recent line(s) as a static label (no spatial motion — see
+ * .claude/rules/watcher-ui.md). The full transcript lives in the web app.
+ *
+ * @param text Latest finalized transcript text (UTF-8, may be truncated).
+ */
+void ui_meeting_transcript_line(const char *text);
+
+/**
+ * @brief Show a coach suggestion card during a meeting.
+ *
+ * Static card near the bottom; auto-dismisses after a few seconds or on tap.
+ *
+ * @param text Coach suggestion display text.
+ */
+void ui_meeting_coach_card(const char *text);
+
+/**
+ * @brief Tear down the meeting screen and restore the idle home wallpaper.
+ *
+ * Safe to call multiple times. Hides meeting widgets and re-shows the home
+ * buttons. Never calls lv_obj_clean (the orb is the wallpaper).
+ */
+void ui_meeting_end(void);
+
+/**
  * @brief Show WiFi setup button at bottom of screen
  *
  * Button appears when WiFi is disconnected, hidden when connected.

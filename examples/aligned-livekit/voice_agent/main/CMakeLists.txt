@@ -24,6 +24,7 @@ idf_component_register(
         "speaking_C.c"
         "speaking_D.c"
         "speaking_E.c"
+        "mic_icon.c"
     INCLUDE_DIRS "."
     REQUIRES
         console
