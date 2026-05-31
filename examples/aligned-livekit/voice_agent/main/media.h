@@ -38,6 +38,18 @@ av_render_handle_t media_get_renderer(void);
 /// Call this before closing a LiveKit room to prevent hangs.
 void media_cleanup(void);
 
+/// Rebuild ONLY the capturer (close + reopen) for a fresh audio-source thread.
+///
+/// The reused esp_capture audio source intermittently fails its first read after
+/// a stop→start cycle on the 2nd+ session ("AUD_SRC: Failed to read audio frame
+/// ret -8") → the capture thread exits → dead mic → choppy/deaf on RECONNECT
+/// (first-connect-after-boot always works because media_init builds it fresh).
+/// Call at the top of join_room on a reconnect (capturer already exists), BEFORE
+/// livekit_room_create starts it. Safe there: the prior room was destroyed by
+/// leave_room, so no peer_task references the capture (unlike media_cleanup during
+/// a live disconnect, which crashes — see .claude/rules/watcher-livekit-teardown.md).
+void media_reset_capturer(void);
+
 /// Mute (or unmute) the microphone at the codec hardware.
 ///
 /// Used for half-duplex echo suppression: while the agent is speaking, we

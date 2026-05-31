@@ -22,6 +22,11 @@ esp_codec_dev_handle_t get_record_handle(void);
 /// Get playback (speaker) handle
 esp_codec_dev_handle_t get_playback_handle(void);
 
+/// Write a single ES8311 codec register directly over I2C. Used for the
+/// half-duplex mic mute (ADC digital-volume REG17) that esp_codec_dev doesn't
+/// expose. Returns 0 on success, -1 on failure.
+int board_codec_write_reg(uint8_t reg, uint8_t val);
+
 /// Initialize IO Expander.
 esp_io_expander_handle_t bsp_io_expander_init(void);
 
@@ -43,6 +48,15 @@ void bsp_system_reboot(void);
 
 /// Complete power off via IO expander. Wake on button press or USB power.
 void bsp_system_shutdown(void);
+
+/// Battery state of charge, 0..100 (ADC voltage → curve-fit; samples 10x).
+uint8_t board_get_battery_percent(void);
+
+/// True when the charger reports charging (PCA9535 CHRG_DET).
+bool board_is_charging(void);
+
+/// True when a battery cell is present (PCA9535 BAT_DET, active-low).
+bool board_is_battery_present(void);
 
 /// Enable/disable touch coordinate debug logging.
 /// When enabled, touch coordinates will be logged to the console.

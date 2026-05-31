@@ -19,6 +19,12 @@ static const char *TAG = "livekit_example";
 static livekit_room_handle_t room_handle;
 static bool agent_joined = false;
 static bool s_leaving_room = false;  /* Re-entry guard for leave_room() */
+// Guards the s_leaving_room check-and-set. leave_room() runs from BOTH
+// button_task (main.c) and the console task (cmd.c) — separate tasks that can
+// race. A plain check-then-set let both callers pass the guard and
+// double-close/destroy the same handle (use-after-free). Same fix pattern as
+// s_watchdog_mux below.
+static portMUX_TYPE s_leave_mux = portMUX_INITIALIZER_UNLOCKED;
 // Live-meeting mode: silent transcription session (vs. conversational voice).
 // Set at connect time (after stale-handle cleanup) and read by the state/data
 // callbacks to drive the meeting UI instead of the voice listening orb.
@@ -392,6 +398,43 @@ static void connect_room_internal(bool meeting)
         ESP_LOGI(TAG, "Reinitializing media systems...");
         media_init();
     }
+    else
+    {
+        // RECONNECT: fully re-init BOTH capturer and renderer — not just the
+        // capturer.
+        //
+        // The Watcher's I2S is DUPLEX (shared RX+TX on one port). On ESP32-S3 the
+        // RX channel cannot be cleanly disabled/re-enabled while TX stays open —
+        // the codec data-if defers it ("pending in channel for out channel
+        // running", audio_codec_data_i2s.c). Tearing down ONLY the capturer (RX)
+        // while the renderer (TX) stayed alive left RX in that half-cycled state,
+        // so the first i2s read after the codec reopen timed out → the esp_capture
+        // audio thread exited → dead mic on ~1/3 of reconnects (the famous
+        // "AUD_SRC ret -8"; first-connect-after-boot always worked).
+        //
+        // The ORIGINAL firmware (commit 19a950f) tore BOTH down together via
+        // media_cleanup() on disconnect and reconnect always worked. That was
+        // moved off the DISCONNECT path because media_cleanup() races the still-
+        // draining peer_task and crashes (see leave_room). Doing the full teardown
+        // here at JOIN time is safe — the prior room was already destroyed by
+        // leave_room (close → settle → destroy), so no peer_task references the
+        // media — and it cycles the whole duplex I2S cleanly, exactly like a cold
+        // boot.
+        ESP_LOGI(TAG, "Reconnect: full media re-init (capturer + renderer) for a clean duplex I2S cycle");
+        media_cleanup();
+        media_init();
+    }
+
+    // Guard: if media init/reset failed, the capturer and/or renderer is NULL.
+    // Creating a room with a NULL capturer publishes silence with no error —
+    // a silent dead session. Bail cleanly so the user sees a failure and can
+    // retry, rather than staring at a listening orb that can't hear them.
+    if (media_get_capturer() == NULL || media_get_renderer() == NULL)
+    {
+        ESP_LOGE(TAG, "Media not ready after init/reset — aborting connect");
+        ui_connection_failed("Audio init failed");
+        return;
+    }
 
     // Always start the session with mic LIVE. The half-duplex echo-suppression
     // path (on_data_received) will mute it during agent speech. If a prior
@@ -409,6 +452,11 @@ static void connect_room_internal(bool meeting)
     {
         ESP_LOGE(TAG, "Failed to create room");
         ui_connection_failed("Audio init failed");
+        // Don't leave a partial/invalid handle behind. The next connect attempt
+        // checks `room_handle != NULL` and would call livekit_room_get_state()
+        // on a half-created handle and crash. Force a clean NULL so the retry
+        // re-creates from scratch.
+        room_handle = NULL;
         return;
     }
 
@@ -475,13 +523,21 @@ void leave_room()
     }
 
     /* Re-entry guard: prevent double leave_room() calls from crashing.
-     * The button task and console commands can race. */
-    if (s_leaving_room)
+     * button_task (main.c) and console commands (cmd.c) run on separate tasks
+     * and can race. The check-and-set MUST be atomic — a plain check-then-set
+     * let both callers pass and double-close/destroy the same handle
+     * (use-after-free). Take the OLD value under the lock; only the caller that
+     * observed `false` proceeds. */
+    bool already_leaving;
+    taskENTER_CRITICAL(&s_leave_mux);
+    already_leaving = s_leaving_room;
+    s_leaving_room = true;
+    taskEXIT_CRITICAL(&s_leave_mux);
+    if (already_leaving)
     {
         ESP_LOGW(TAG, "Already leaving room, ignoring duplicate request");
         return;
     }
-    s_leaving_room = true;
 
     livekit_room_handle_t handle = room_handle;
     room_handle = NULL;  /* Clear immediately to prevent re-entry via room_is_active() */

@@ -34,6 +34,7 @@ idf_component_register(
         esp_wifi
         nvs_flash
         esp_lcd
+        esp_adc
         esp_codec_dev
         esp_io_expander
         esp_lcd_spd2010

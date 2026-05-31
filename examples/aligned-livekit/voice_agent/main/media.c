@@ -10,6 +10,8 @@
 #include "esp_codec_dev.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
+#include "freertos/task.h"
+#include "av_render.h"
 
 #include "media.h"
 
@@ -31,6 +33,15 @@ typedef struct
 
 static capture_system_t capturer_system;
 static renderer_system_t renderer_system;
+
+// NOTE: thread core/priority/stack for the WHOLE pipeline (Adec, ARender,
+// lk_peer_*, aenc_0, AUD_SRC, …) is owned by the LiveKit component's single
+// global scheduler callback in components/livekit__livekit/core/system.c
+// (`media_lib_scheduler`). Do NOT register a second media_lib_thread_set_schedule_cb
+// here — there is only one global slot, so it REPLACES system.c's and strips every
+// task's tuned stack/priority (e.g. lk_peer_pub drops 25 KB → 4 KB default →
+// stack overflow during ICE → reboot). The Adec/ARender core pinning lives in
+// system.c for exactly this reason.
 
 static int build_capturer_system(void)
 {
@@ -106,6 +117,21 @@ static int build_renderer_system(void)
     };
     av_render_set_fixed_frame_info(renderer_system.av_renderer_handle, &frame_info);
 
+    // Playback preroll + buffer floor. The render loop (av_render.c:692/700) keeps
+    // the decoded-PCM FIFO between the component's re-arm point (3 frames ≈ 5808 B)
+    // and this threshold: it starts/resumes only once the FIFO holds this many
+    // BYTES, giving a cushion bigger than the I2S TX DMA ring (~60 ms). 1 frame ≈
+    // 1936 B → 8192 B ≈ 4 frames ≈ 85 ms.
+    // Why 8192 specifically:
+    //  - ABOVE the 3-frame re-arm point, so the FIFO is held at a real 3–4 frame
+    //    floor → the TX DMA ring never underruns → no crackle/break-up.
+    //  - Safe from the rebuffer-"lockup" that 12288 B caused, because Adec/ARender
+    //    are now pinned to core 1 (system.c) and no longer starve behind WiFi, so
+    //    the FIFO refills to threshold fast instead of never catching up.
+    // The FIFO is in PSRAM (no internal-RAM cost). Tradeoff: ~85 ms added latency
+    // at the start of each agent utterance — imperceptible for the greeting.
+    av_render_set_audio_threshold(renderer_system.av_renderer_handle, 8192);
+
     ESP_LOGI(TAG, "Renderer configured: %d Hz, %d ch, %d bits",
              (int)frame_info.sample_rate, (int)frame_info.channel, (int)frame_info.bits_per_sample);
     ESP_LOGI(TAG, "Audio buffers: raw=%d bytes, render=%d bytes",
@@ -124,15 +150,37 @@ static int build_renderer_system(void)
 // crackle remains a known small artifact; pre-roll silence is the
 // next lever to try (see media_init plan in PR description).
 
+// Playback crackle was diagnosed (2026-05-28) to a TX I2S DMA underrun, NOT a
+// render-FIFO underrun or decode error: the av_render consumer thread is preempted
+// (WiFi prio-23 RX bursts) for gaps up to ~60-78 ms, and the default ~30 ms TX DMA
+// ring couldn't bridge them. Fixed by deepening the ring to ~60 ms in board.c
+// (bsp_audio_init, dma_desc_num=12) — the max this memory-tight device affords before
+// the I2S ring starves the LCD strip's internal DMA RAM. Measured with temporary
+// instrumentation (av_render_get_audio_fifo_level FIFO trace + per-write gap/drift
+// histogram in i2s_render.c + heap_caps_get_largest_free_block); re-add those if it
+// regresses. Residual: ring depth has diminishing returns (gaps scale with it); full
+// elimination needs pinning the ARender thread off WiFi's core — deferred (the
+// priority-bump variant above crash-looped).
+
 int media_init(void)
 {
     // Register default audio encoder and decoder
     esp_audio_enc_register_default();
     esp_audio_dec_register_default();
 
-    // Build capturer and renderer systems
-    build_capturer_system();
-    build_renderer_system();
+    // Build capturer and renderer systems. Propagate failures — a NULL capturer
+    // or renderer otherwise sails through to livekit_room_create() and the
+    // session publishes/plays nothing with no error surfaced to the user.
+    int rc = build_capturer_system();
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Capturer build failed (%d) — media not initialized", rc);
+        return rc;
+    }
+    rc = build_renderer_system();
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Renderer build failed (%d) — media not initialized", rc);
+        return rc;
+    }
     return 0;
 }
 
@@ -153,6 +201,26 @@ av_render_handle_t media_get_renderer(void)
 // agent → it hears itself. Mute on "speaking" is still applied
 // immediately so we never miss the start of the agent's audio.
 #define MIC_UNMUTE_DRAIN_DELAY_MS 300
+
+// Mic input gain (ES8311 analog PGA, dB). Normal capture = 27 dB (matches board.c
+// DRV_AUDIO_MIC_GAIN init); muted drops to the PGA's 0 dB floor (~27 dB cut).
+//
+// ⚠️ DO NOT mute at the codec — ANY codec-level mute kills capture on this board.
+// Verified 2026-05-27 the hard way: both esp_codec_dev_set_in_mute() AND a direct
+// ES8311 ADC-digital-volume write (REG17=0x00) make the I2S read fail
+// ("AUD_SRC: Failed to read audio frame ret -8"), so the esp_capture audio-source
+// thread EXITS and the mic goes permanently deaf ("agent stops responding"). The
+// REG17 path passed once by timing luck, then killed capture in the next session.
+// Setting the ADC volume to full-mute stops the codec emitting valid I2S frames,
+// which the capture reader can't survive. Changing only the analog PGA gain
+// (set_in_gain → REG16) keeps the I2S stream flowing, so it's the only
+// capture-safe lever — but 27 dB attenuation is NOT enough to fully suppress the
+// speaker echo under xAI's server-side VAD. Real echo suppression must happen
+// DOWNSTREAM of the codec (drop/zero the published audio while the agent speaks),
+// handled agent-side — see media_set_mic_muted() callers + agent.py. This stays
+// as a cheap extra attenuation that can never go deaf.
+#define MIC_ACTIVE_GAIN_DB  (27.0f)
+#define MIC_MUTED_GAIN_DB   (0.0f)
 static TimerHandle_t s_unmute_timer = NULL;
 
 static void apply_codec_mute(bool muted)
@@ -161,11 +229,14 @@ static void apply_codec_mute(bool muted)
     if (record_handle == NULL) {
         return;
     }
-    int rc = esp_codec_dev_set_in_mute(record_handle, muted);
+    // Analog PGA gain only — capture-safe. See the banner above for why a real
+    // codec mute (set_in_mute / REG17=0x00) is forbidden here.
+    float gain_db = muted ? MIC_MUTED_GAIN_DB : MIC_ACTIVE_GAIN_DB;
+    int rc = esp_codec_dev_set_in_gain(record_handle, gain_db);
     if (rc != 0) {
-        ESP_LOGW(TAG, "esp_codec_dev_set_in_mute(%d) failed: %d", (int)muted, rc);
+        ESP_LOGW(TAG, "esp_codec_dev_set_in_gain(%.0f) failed: %d", gain_db, rc);
     } else {
-        ESP_LOGI(TAG, "Mic %s", muted ? "muted" : "unmuted");
+        ESP_LOGI(TAG, "Mic %s (gain %.0f dB)", muted ? "attenuated" : "active", gain_db);
     }
 }
 
@@ -242,4 +313,23 @@ void media_cleanup(void)
     }
 
     ESP_LOGI(TAG, "Media cleanup complete");
+}
+
+void media_reset_capturer(void)
+{
+    // Close the (possibly degraded) reused capturer and build a fresh one so the
+    // new session gets a clean audio-source thread. Fixes the reconnect "AUD_SRC:
+    // Failed to read audio frame ret -8" that kills capture on the 2nd+ session.
+    // The renderer is left intact (it wasn't implicated in the -8, and recreating
+    // it is only risky during a live disconnect, not here at join time).
+    if (capturer_system.capturer_handle != NULL) {
+        ESP_LOGI(TAG, "Resetting capturer for a fresh session...");
+        esp_capture_close(capturer_system.capturer_handle);
+        capturer_system.capturer_handle = NULL;
+    }
+    // NOTE: the previous capturer_system.audio_source is not freed (esp_capture
+    // exposes no src-destroy; build_capturer_system overwrites the pointer). The
+    // src struct is tiny, so the per-reconnect leak is negligible for session
+    // cadence. Revisit if a destroy API appears.
+    build_capturer_system();
 }

@@ -55,6 +55,11 @@ typedef enum {
     EV_MAX_RETRIES_REACHED, /// Maximum number of retry attempts reached.
     _EV_STATE_ENTER,        /// State enter hook (internal).
     _EV_STATE_EXIT,         /// State exit hook (internal).
+    _EV_WAKE,               /// No-op used by engine_destroy to unblock the task
+                            /// from xQueueReceive() so it can observe
+                            /// is_running==false and self-delete. No state
+                            /// handler has a case for it (all hit `default`),
+                            /// so it is a guaranteed no-op in every state.
 } engine_event_type_t;
 
 /// An event processed by the engine state machine.
@@ -111,6 +116,11 @@ typedef struct {
     session_state_t session;
 
     TaskHandle_t task_handle;
+    SemaphoreHandle_t task_done; /// Given by engine_task right before it
+                                 /// self-deletes; engine_destroy waits on it so
+                                 /// it never force-deletes a task that already
+                                 /// vTaskDelete(NULL)'d itself (double-delete →
+                                 /// uxListRemove LoadProhibited).
     QueueHandle_t event_queue;
     TimerHandle_t timer;
     bool is_running;
@@ -1063,6 +1073,15 @@ static void engine_task(void *arg)
 
     // Discard any remaining events in the queue before exiting.
     flush_event_queue(eng);
+
+    // Signal engine_destroy that the loop has exited. After this give we must
+    // NOT touch `eng` again (destroy may free it the instant it wakes), so
+    // capture the handle first and do nothing but self-delete afterward. This
+    // give is what lets destroy avoid a second vTaskDelete on this task.
+    SemaphoreHandle_t done = eng->task_done;
+    if (done != NULL) {
+        xSemaphoreGive(done);
+    }
     vTaskDelete(NULL);
 }
 
@@ -1125,6 +1144,12 @@ engine_handle_t engine_init(const engine_options_t *options)
         goto _init_failed;
     }
 
+    // Must exist before the task starts — engine_task gives it on exit.
+    eng->task_done = xSemaphoreCreateBinary();
+    if (eng->task_done == NULL) {
+        goto _init_failed;
+    }
+
     if (xTaskCreate(
         engine_task,
         "engine_task",
@@ -1176,9 +1201,34 @@ engine_err_t engine_destroy(engine_handle_t handle)
     engine_t *eng = (engine_t *)handle;
     eng->is_running = false;
     if (eng->task_handle != NULL) {
-        // TODO: Wait for disconnected state or timeout
-        vTaskDelay(pdMS_TO_TICKS(100));
-        vTaskDelete(eng->task_handle);
+        // Unblock engine_task from its xQueueReceive(portMAX_DELAY) so it
+        // observes is_running==false at the top of the loop and self-deletes.
+        // Clearing the flag alone is not enough — the task is parked on the
+        // queue. _EV_WAKE is a no-op in every state handler.
+        engine_event_t wake = { .type = _EV_WAKE };
+        event_enqueue(eng, &wake, true /* to front */);
+
+        // Wait for the task to actually exit + self-delete, rather than the old
+        // `vTaskDelay(100); vTaskDelete(task_handle)`. That double-deleted the
+        // task whenever a late event woke it inside that 100 ms window: it saw
+        // is_running==false, exited, vTaskDelete(NULL)'d itself, and then this
+        // function deleted the already-freed TCB → uxListRemove LoadProhibited
+        // at engine.c:1181 (intermittent; reproduced on the first disconnect
+        // after a flash, 2026-05-29).
+        if (eng->task_done == NULL ||
+            xSemaphoreTake(eng->task_done, pdMS_TO_TICKS(3000)) != pdTRUE) {
+            // Timed out: the task never reached its exit handshake, so it has
+            // NOT self-deleted. Force-deleting here is therefore the SOLE
+            // delete (no double-delete) — a last-resort liveness guard that
+            // should never fire in practice.
+            ESP_LOGE(TAG, "engine_task did not exit in time; forcing delete");
+            vTaskDelete(eng->task_handle);
+        }
+        eng->task_handle = NULL;
+    }
+    if (eng->task_done != NULL) {
+        vSemaphoreDelete(eng->task_done);
+        eng->task_done = NULL;
     }
     if (eng->timer != NULL) {
         xTimerDelete(eng->timer, portMAX_DELAY);

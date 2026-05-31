@@ -4,6 +4,7 @@
 #include "wifi_setup.h"
 #include "esp_log.h"
 #include "example.h"
+#include "board.h"  // board_get_battery_percent / board_is_charging / board_is_battery_present
 
 static const char *TAG = "ui";
 
@@ -19,6 +20,7 @@ static lv_timer_t *wifi_check_timer = NULL;
 static lv_obj_t *status_bar = NULL;        // Container for status icons
 static lv_obj_t *wifi_status_icon = NULL;  // WiFi icon label
 static lv_obj_t *voice_status_icon = NULL; // Voice chat icon label
+static lv_obj_t *battery_status_label = NULL; // Battery "NN%" (⚡ + green when charging, red when low)
 static lv_obj_t *hint_label = NULL;        // "Hold knob to disconnect" hint (under status bar)
 static lv_obj_t *knob_progress_bar = NULL; // Fills 0→100% across BUTTON_LONG_PRESS_MS while held
 static lv_obj_t *failure_label = NULL;     // "Auth failed — re-pair" (centered, red)
@@ -54,6 +56,7 @@ static void create_wifi_button(void);
 static void update_wifi_button_visibility(void);
 static void create_status_bar(void);
 static void update_status_bar(void);
+static void update_battery_status(void);
 static void create_hint_label(void);
 static void update_hint_label(void);
 static void create_meeting_button(void);
@@ -512,8 +515,10 @@ static void create_status_bar(void)
     }
 
     // Style: semi-transparent dark background, positioned at top
-    // For a 412x412 round display, the usable width at top is narrower
-    lv_obj_set_size(status_bar, 120, 30);
+    // For a 412x412 round display, the usable width at top is narrower.
+    // 150px (was 120) fits WiFi + call glyphs plus the "⚡100%" battery label
+    // under SPACE_EVENLY; centered it spans x≈131..281, inside the round bezel.
+    lv_obj_set_size(status_bar, 150, 30);
     lv_obj_align(status_bar, LV_ALIGN_TOP_MID, 0, 25); // Offset down from edge for round screen
     lv_obj_set_style_bg_color(status_bar, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(status_bar, LV_OPA_60, 0);
@@ -541,7 +546,22 @@ static void create_status_bar(void)
     lv_obj_set_style_text_font(voice_status_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(voice_status_icon, lv_color_hex(0x808080), 0); // Grey initially
 
+    // Battery percentage label (rightmost). Text + color are filled in by
+    // update_battery_status(); "--%" is the pre-first-read placeholder.
+    battery_status_label = lv_label_create(status_bar);
+    if (battery_status_label) {
+        lv_label_set_text(battery_status_label, "--%");
+        lv_obj_set_style_text_font(battery_status_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(battery_status_label, lv_color_hex(0xFFFFFF), 0);
+    }
+
     ESP_LOGI(TAG, "Status bar created");
+
+    // Populate the battery reading immediately so it shows on first paint
+    // rather than waiting for the first ~30s timer tick. We're under the
+    // caller's LVGL lock here (create_status_bar is only called from locked
+    // contexts), so the lv_label update is safe.
+    update_battery_status();
 }
 
 /**
@@ -574,6 +594,59 @@ static void update_status_bar(void)
     }
 
     s_last_wifi_connected = wifi_connected;
+}
+
+/**
+ * @brief Refresh the battery percentage label in the status bar.
+ *
+ * Reads the BSP state-of-charge (ADC voltage → quadratic curve-fit) and charge
+ * state. Caller must hold the LVGL lock (this only runs from create_status_bar
+ * and the wifi_check_timer lv_timer callback, both already locked). The bsp_*
+ * reads themselves need no LVGL lock.
+ *
+ * - No battery present (USB-only, no cell): hide the label.
+ * - Charging: prefix ⚡ and color green.
+ * - Low (≤15%): red. Otherwise white.
+ */
+static void update_battery_status(void)
+{
+    if (battery_status_label == NULL) {
+        return;
+    }
+
+    // NOTE: do NOT gate on board_is_battery_present(). The Watcher has a
+    // built-in cell, and on this hardware BAT_DET reads HIGH (expander 0xffd9),
+    // which the active-low presence check mistook for "absent" and hid the
+    // label entirely. Always show the reading.
+    //
+    // Charging/USB state is a cheap expander read → refresh EVERY call (~2s) so
+    // plug/unplug reflects quickly. The percentage needs a 10x ADC sample and
+    // changes slowly → re-read only every ~30s (15 ticks) and cache between.
+    static int s_cached_pct = -1;
+    static uint8_t pct_tick = 0;
+    if (s_cached_pct < 0 || pct_tick == 0) {
+        s_cached_pct = (int)board_get_battery_percent(); // 0..100 (samples ADC 10x)
+        ESP_LOGI(TAG, "Battery: %d%%", s_cached_pct);
+    }
+    pct_tick = (uint8_t)((pct_tick + 1) % 15);
+
+    int pct = s_cached_pct;
+    bool charging = board_is_charging(); // USB present (see board.c)
+
+    char buf[16];
+    if (charging) {
+        // ⚡ + percent. If LV_SYMBOL_CHARGE renders as a box on-device, the
+        // green color still conveys "on power".
+        snprintf(buf, sizeof(buf), LV_SYMBOL_CHARGE "%d%%", pct);
+    } else {
+        snprintf(buf, sizeof(buf), "%d%%", pct);
+    }
+    lv_label_set_text(battery_status_label, buf);
+
+    uint32_t color = charging ? 0x4CAF50               // green on USB power
+                              : (pct <= 15 ? 0xF44336  // red when low on battery
+                                           : 0xFFFFFF); // white otherwise
+    lv_obj_set_style_text_color(battery_status_label, lv_color_hex(color), 0);
 }
 
 //=============================================================================
@@ -972,6 +1045,11 @@ static void wifi_check_timer_cb(lv_timer_t *timer)
     // re-hide the "Connecting..." hint between the CONNECTING and CONNECTED
     // state changes. ui_wifi_connecting() / ui_set_voice_active() own the
     // hint visibility directly.
+
+    // Refresh the battery indicator every tick (~2s) so charging/USB state is
+    // responsive on plug/unplug. update_battery_status() internally throttles
+    // the costly ADC % sample to ~30s; the charge glyph/color updates each call.
+    update_battery_status();
 }
 
 /**
@@ -1381,7 +1459,10 @@ void ui_meeting_coach_card(const char *text)
     if (meeting_coach_card == NULL) {
         meeting_coach_card = lv_obj_create(lv_scr_act());
         if (meeting_coach_card) {
-            lv_obj_set_size(meeting_coach_card, 320, LV_SIZE_CONTENT);
+            // 412px round AMOLED: the usable chord narrows toward the bottom.
+            // 300px keeps the card's lower corners inside the circle at this
+            // y-offset (a 320px card sat right at the edge).
+            lv_obj_set_size(meeting_coach_card, 300, LV_SIZE_CONTENT);
             lv_obj_align(meeting_coach_card, LV_ALIGN_BOTTOM_MID, 0, -82);
             lv_obj_set_style_bg_color(meeting_coach_card, lv_color_hex(0x1E88E5), 0);
             lv_obj_set_style_bg_opa(meeting_coach_card, LV_OPA_COVER, 0);
@@ -1393,7 +1474,7 @@ void ui_meeting_coach_card(const char *text)
 
             meeting_coach_label = lv_label_create(meeting_coach_card);
             lv_label_set_long_mode(meeting_coach_label, LV_LABEL_LONG_WRAP);
-            lv_obj_set_width(meeting_coach_label, 296);
+            lv_obj_set_width(meeting_coach_label, 276);  // 300 card − 2×10 pad − slack
             lv_obj_set_style_text_color(meeting_coach_label, lv_color_hex(0xFFFFFF), 0);
             lv_obj_set_style_text_font(meeting_coach_label, &lv_font_montserrat_14, 0);
         }

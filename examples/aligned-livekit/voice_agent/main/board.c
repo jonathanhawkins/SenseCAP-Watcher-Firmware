@@ -26,6 +26,9 @@
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 #include "esp_system.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "ui.h"
 
 static const char *TAG = "board";
@@ -81,6 +84,19 @@ static const char *TAG = "board";
 #define BSP_PWR_GROVE            (IO_EXPANDER_PIN_NUM_14)
 #define BSP_PWR_BAT_ADC          (IO_EXPANDER_PIN_NUM_15)
 #define BSP_PWR_START_UP         (BSP_PWR_SDCARD | BSP_PWR_LCD | BSP_PWR_SYSTEM | BSP_PWR_AI_CHIP | BSP_PWR_CODEC_PA | BSP_PWR_GROVE | BSP_PWR_BAT_ADC | BSP_SSCMA_CLIENT_RST)
+
+/* Charge-detect inputs (PCA9535 P0.x; part of DRV_IO_EXP_INPUT_MASK 0x20ff).
+   Battery-present is BSP_PWR_BAT_DET (pin 13) above — also an input bit.
+   CHRG_DET alone can't tell "on power" from "on battery" (it reads HIGH both
+   when the pack is full-on-charger and when unplugged), so VBUS_IN_DET (USB
+   present, active-low) drives the charging indicator. */
+#define BSP_PWR_CHRG_DET         (IO_EXPANDER_PIN_NUM_0)
+#define BSP_PWR_VBUS_IN_DET      (IO_EXPANDER_PIN_NUM_2)
+/* Battery voltage sense: ADC1 ch2 (GPIO3), 2.5 dB atten, 4.1x divider
+   (62k+20k / 20k). Divider rail is powered by BSP_PWR_BAT_ADC at boot.
+   Mirrors components/sensecap-watcher/include/sensecap-watcher.h. */
+#define BSP_BAT_ADC_CHAN         (ADC_CHANNEL_2)
+#define BSP_BAT_ADC_ATTEN        (ADC_ATTEN_DB_2_5)
 #define BSP_SSCMA_CLIENT_RST_LOW (IO_EXPANDER_PIN_NUM_7)
 #define BSP_TOUCH_I2C_CLK        (400000)
 
@@ -276,6 +292,18 @@ static esp_err_t bsp_audio_init(void)
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(BSP_AUDIO_I2S_NUM, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
     chan_cfg.intr_priority = 4;
+    // Deepen the TX DMA ring from the IDF default (6 desc x 240 frames = ~30 ms @ 48 kHz)
+    // to ~60 ms. WRITE_DIAG instrumentation on i2s_render_write measured the av_render
+    // consumer thread being preempted (WiFi-RX bursts / LiveKit peer_task) for gaps up to
+    // 60 ms during a greeting (steady-state worst 35 ms); a 30 ms ring underran on those
+    // gaps -> the "crackle while it talks". Raising the av_render thread priority is a
+    // KNOWN crash (priority inversion vs peer_task — see media.c), so the ring depth is the
+    // lever. NOTE: this is a memory-constrained device — the I2S DMA ring competes with the
+    // 32 KB LCD strip for INTERNAL DMA RAM. dma_desc_num=20 (~100 ms) caused LCD ESP_ERR_NO_MEM
+    // and broke the LiveKit connect; 12 (~60 ms) covers the 35 ms steady-state gap with margin
+    // at +5.8 KB. dma_frame_num stays 240 so RX/capture granularity (and the duplex-reconnect
+    // fix) are unchanged. IDF only requires dma_desc_num >= 2 (i2s_common.c:948).
+    chan_cfg.dma_desc_num = 12;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &i2s_tx_chan, &i2s_rx_chan));
 
     i2s_std_config_t std_cfg_default = BSP_I2S_DUPLEX_MONO_CFG(DRV_AUDIO_SAMPLE_RATE);
@@ -579,6 +607,21 @@ static esp_codec_dev_handle_t bsp_audio_codec_speaker_init(void)
         .data_if = i2s_data_if,
     };
     return esp_codec_dev_new(&codec_dev_cfg);
+}
+
+// Write a single ES8311 register directly over the (legacy) I2C bus the codec
+// already lives on. esp_codec_dev exposes set_in_gain (analog PGA, 0 dB floor)
+// and set_in_mute (disables the ADC → kills esp_capture), but NOT the ADC
+// digital-volume register (REG17), which is the only way to get a true,
+// capture-safe mic mute. Used by media.c::apply_codec_mute for half-duplex
+// echo suppression. The legacy i2c driver serializes the bus, so this is safe
+// to call concurrently with esp_codec_dev gain writes.
+int board_codec_write_reg(uint8_t reg, uint8_t val)
+{
+    uint8_t buf[2] = { reg, val };
+    esp_err_t ret = i2c_master_write_to_device(BSP_GENERAL_I2C_NUM, DRV_ES8311_I2C_ADDR,
+                                               buf, sizeof(buf), pdMS_TO_TICKS(50));
+    return (ret == ESP_OK) ? 0 : -1;
 }
 
 static esp_err_t bsp_i2c_check(i2c_port_t port, uint8_t address)
@@ -1032,6 +1075,95 @@ bool board_is_knob_pressed(void)
 
     // Button is active-low on the expander.
     return (pin_values & BSP_KNOB_BTN) == 0;
+}
+
+// ---- Battery / charge state -----------------------------------------------
+// The factory BSP (components/sensecap-watcher) provides bsp_battery_* and
+// bsp_system_is_charging, but this example links its own board.c instead of
+// that component, so the few readers the status-bar UI needs are reimplemented
+// here using the same ADC path + curve-fit and the same PCA9535 bits the BSP
+// uses. Safe to call from the LVGL timer task (single ADC consumer; the
+// expander I2C reads are serialized by the ESP-IDF I2C driver).
+
+static uint16_t board_battery_get_voltage_mv(void)
+{
+    static bool adc_ready = false;
+    static adc_oneshot_unit_handle_t adc_handle = NULL;
+    static adc_cali_handle_t cali_handle = NULL;
+
+    if (!adc_ready) {
+        adc_oneshot_unit_init_cfg_t init_cfg = { .unit_id = ADC_UNIT_1 };
+        if (adc_oneshot_new_unit(&init_cfg, &adc_handle) != ESP_OK) {
+            return 0;
+        }
+        adc_oneshot_chan_cfg_t ch_cfg = {
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+            .atten = BSP_BAT_ADC_ATTEN,
+        };
+        adc_oneshot_config_channel(adc_handle, BSP_BAT_ADC_CHAN, &ch_cfg);
+        adc_cali_curve_fitting_config_t cali_cfg = {
+            .unit_id = ADC_UNIT_1,
+            .chan = BSP_BAT_ADC_CHAN,
+            .atten = BSP_BAT_ADC_ATTEN,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &cali_handle) != ESP_OK) {
+            return 0;
+        }
+        adc_ready = true;
+    }
+
+    int raw = 0, mv = 0;
+    if (adc_oneshot_read(adc_handle, BSP_BAT_ADC_CHAN, &raw) != ESP_OK) {
+        return 0;
+    }
+    adc_cali_raw_to_voltage(cali_handle, raw, &mv);
+    mv = mv * 82 / 20; // undo the 4.1x divider (62k+20k / 20k)
+    return (uint16_t)mv;
+}
+
+uint8_t board_get_battery_percent(void)
+{
+    int32_t mv = 0;
+    for (uint8_t i = 0; i < 10; i++) {
+        mv += board_battery_get_voltage_mv();
+    }
+    mv /= 10;
+    // Quadratic voltage→% curve-fit (from the SenseCAP BSP), tuned for this
+    // cell chemistry. Clamp to [0,100].
+    int pct = (int)((-1 * mv * mv + 9016 * mv - 19189000) / 10000);
+    if (pct > 100) pct = 100;
+    if (pct < 0)   pct = 0;
+    return (uint8_t)pct;
+}
+
+bool board_is_charging(void)
+{
+    if (io_exp_handle == NULL) {
+        return false;
+    }
+    uint32_t pin_values = 0;
+    // VBUS_IN_DET, not CHRG_DET: CHRG_DET reads HIGH both when full-on-charger
+    // and when unplugged, so the bolt never cleared on unplug. VBUS_IN_DET is
+    // active-low — LOW = USB plugged in (verified: expander 0xffd9, bit2=0 on
+    // USB). So "on external power" = VBUS line low.
+    if (esp_io_expander_get_level(io_exp_handle, BSP_PWR_VBUS_IN_DET, &pin_values) != ESP_OK) {
+        return false;
+    }
+    return (pin_values & BSP_PWR_VBUS_IN_DET) == 0; // LOW = USB present
+}
+
+bool board_is_battery_present(void)
+{
+    if (io_exp_handle == NULL) {
+        return true; // unknown → assume present so a reading still shows
+    }
+    uint32_t pin_values = 0;
+    if (esp_io_expander_get_level(io_exp_handle, BSP_PWR_BAT_DET, &pin_values) != ESP_OK) {
+        return true;
+    }
+    // Active-low: BAT_DET low = battery present (mirrors bsp_battery_is_present).
+    return (pin_values & BSP_PWR_BAT_DET) == 0;
 }
 
 void bsp_system_deep_sleep(uint32_t time_in_sec)

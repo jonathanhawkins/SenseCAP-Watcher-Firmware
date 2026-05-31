@@ -59,9 +59,21 @@ static void media_lib_scheduler(const char *name, media_lib_thread_cfg_t *cfg)
     } else if (strcmp(name, "Adec") == 0) {
         cfg->stack_size = 40 * 1024;
         cfg->priority = 15;
-        cfg->core_id = 0;
+        // core 1 (was 0): keep the Opus decoder OFF core 0, which runs the WiFi
+        // driver task at prio 23. On core 0 the decoder (prio 15) lost every
+        // contest to WiFi RX bursts during agent speech, so the decoded-PCM FIFO
+        // failed to refill — audible break-up, and with a playback threshold set,
+        // a rebuffer-loop "lockup". Core 1 co-locates it with lk_peer_sub (the
+        // task that receives the agent's audio), so the whole RX→decode→render
+        // chain runs on core 1, away from WiFi.
+        cfg->core_id = 1;
     } else if (strcmp(name, "ARender") == 0) {
         cfg->priority = 20;
+        // core 1 (was default 0): same reason as Adec — keep the PCM renderer
+        // that feeds the I2S TX DMA off WiFi's core so the ring never underruns
+        // (the "crackle"). Pairs with board.c's deepened TX DMA ring + the small
+        // playback preroll in media.c.
+        cfg->core_id = 1;
     }
 }
 
