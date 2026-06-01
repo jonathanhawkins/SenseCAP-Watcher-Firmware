@@ -318,7 +318,13 @@ esp_err_t aligned_get_livekit_credentials(void) {
     if (status_code != 200) {
         ESP_LOGE(TAG, "API returned error status: %d", status_code);
         ESP_LOGE(TAG, "Response: %s", g_http_response_buffer);
-        if (status_code == 401 || status_code == 403) {
+        if (status_code == 402) {
+            // Backend pre-checked xAI and the account is out of credits — the
+            // agent would join but stay silent. Show a clear, actionable string
+            // instead of "Agent unavailable". (api/routes/watcher/device.py
+            // returns 402 when _xai_credits_available() is false.)
+            g_last_error_msg = "Voice credits empty";
+        } else if (status_code == 401 || status_code == 403) {
             g_last_error_msg = "Token rejected";
         } else if (status_code >= 500) {
             g_last_error_msg = "Server error";
