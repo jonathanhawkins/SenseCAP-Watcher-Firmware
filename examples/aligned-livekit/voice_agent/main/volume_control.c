@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "driver/gpio.h"
 #include "board.h"
+#include "ui.h"  // ui_plan_is_active / ui_plan_move_selection — wheel drives the plan picker when it's up
 
 static const char *TAG = "volume_ctrl";
 
@@ -239,13 +240,17 @@ static void encoder_poll_timer_cb(lv_timer_t *timer)
         if (s_encoder_count >= ENCODER_TRIGGER_THRESHOLD) {
             s_encoder_count = 0;
             ESP_LOGI(TAG, ">>> Encoder CW rotation detected");
-            if (can_update_volume()) {
+            if (ui_plan_is_active()) {
+                ui_plan_move_selection(1);   // plan picker up: move highlight, not volume
+            } else if (can_update_volume()) {
                 volume_control_down();
             }
         } else if (s_encoder_count <= -ENCODER_TRIGGER_THRESHOLD) {
             s_encoder_count = 0;
             ESP_LOGI(TAG, ">>> Encoder CCW rotation detected");
-            if (can_update_volume()) {
+            if (ui_plan_is_active()) {
+                ui_plan_move_selection(-1);
+            } else if (can_update_volume()) {
                 volume_control_up();
             }
         }

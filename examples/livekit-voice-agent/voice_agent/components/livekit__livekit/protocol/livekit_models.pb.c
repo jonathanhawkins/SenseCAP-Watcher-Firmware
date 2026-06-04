@@ -39,15 +39,6 @@ PB_BIND(LIVEKIT_PB_SIMULCAST_CODEC_INFO, livekit_pb_simulcast_codec_info_t, AUTO
 PB_BIND(LIVEKIT_PB_TRACK_INFO, livekit_pb_track_info_t, AUTO)
 
 
-PB_BIND(LIVEKIT_PB_DATA_TRACK_INFO, livekit_pb_data_track_info_t, AUTO)
-
-
-PB_BIND(LIVEKIT_PB_DATA_TRACK_EXTENSION_PARTICIPANT_SID, livekit_pb_data_track_extension_participant_sid_t, AUTO)
-
-
-PB_BIND(LIVEKIT_PB_DATA_TRACK_SUBSCRIPTION_OPTIONS, livekit_pb_data_track_subscription_options_t, AUTO)
-
-
 PB_BIND(LIVEKIT_PB_VIDEO_LAYER, livekit_pb_video_layer_t, AUTO)
 
 
@@ -157,8 +148,6 @@ PB_BIND(LIVEKIT_PB_WEBHOOK_CONFIG, livekit_pb_webhook_config_t, AUTO)
 
 
 PB_BIND(LIVEKIT_PB_SUBSCRIBED_AUDIO_CODEC, livekit_pb_subscribed_audio_codec_t, AUTO)
-
-
 
 
 

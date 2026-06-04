@@ -90,6 +90,12 @@ static esp_capture_err_t audio_dev_src_start(esp_capture_audio_src_if_t *h)
         .bits_per_sample = src->info.bits_per_sample,
         .channel = src->info.channel,
     };
+    // NOTE (2026-06-04): tried forcing channel=2 + channel_mask bit 1 here to pin
+    // the watcher mic's RIGHT slot on reconnect — it did NOT fix the silent slot
+    // AND it introduced "i2s_channel_disable: channel not enabled" + an ~11s
+    // reconnect loop (the channel=2 open desyncs the duplex-I2S channel state).
+    // Reverted. The reconnect slot routing is pinned at the I2S-peripheral level,
+    // not the codec channel_mask — fix is being investigated there, not here.
     int ret = esp_codec_dev_open(src->handle, &fs);
     if (ret != 0) {
         ESP_LOGE(TAG, "Failed to open codec device, ret=%d", ret);

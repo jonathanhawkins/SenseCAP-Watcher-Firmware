@@ -110,7 +110,7 @@ static const char *TAG = "board";
 #define DRV_AUDIO_SAMPLE_RATE (48000)
 #define DRV_AUDIO_SAMPLE_BITS (16)
 #define DRV_AUDIO_CHANNELS    (1)
-#define DRV_AUDIO_MIC_GAIN    (27.0)
+#define DRV_AUDIO_MIC_GAIN    (36.0)  // was 27 (ES8311 quantized to 24dB → far-field voice too quiet); see media.c MIC_ACTIVE_GAIN_DB
 #define DRV_AUDIO_I2S_CHANNEL (1)
 
 /* LCD Settings (match SenseCAP firmware) */
@@ -805,6 +805,104 @@ static esp_err_t bsp_codec_set_fs(uint32_t rate, uint32_t bits_cfg, i2s_slot_mod
     if (codec_mutex)
         xSemaphoreGive(codec_mutex);
     return ret;
+}
+
+// Re-pin the mic to the RIGHT I2S slot on the reconnect JOIN path.
+//
+// ROOT CAUSE (verified 2026-06-04, I2S-peripheral level):
+//   The slot is selected by i2s_channel_reconfig_std_slot() (via the codec
+//   data-if set_drv_fs, audio_codec_data_i2s.c). At BOOT, bsp_audio_init pins
+//   the RX channel to I2S_STD_SLOT_RIGHT (slot 1 = the only wired ADC slot) and
+//   bsp_codec_set_fs opens record with channel=2 + channel_mask=MAKE_CHANNEL_MASK(1),
+//   which (a) keeps slot RIGHT and (b) leaves record_dev_handle->input_opened=true.
+//   The capturer's first esp_codec_dev_open(channel=1) then hits the "Input
+//   already open" no-op (esp_codec_dev.c) and never reaches set_fmt, so it
+//   cannot remap the slot. Boot mic works.
+//
+//   On a DISCONNECT, the LiveKit teardown closes the record codec
+//   (input_opened=false). On RECONNECT the capturer's esp_codec_dev_open runs
+//   set_fmt for real with channel=1, and _i2s_data_set_fmt UNCONDITIONALLY
+//   rewrites a mono (channel==1) open to channel=2 + channel_mask=MAKE_CHANNEL_MASK(0)
+//   = slot 0 = LEFT = the UNWIRED, silent slot. Hence "mic captures the silent
+//   slot on every reconnect" (micdbg peak ~9-80 instead of thousands).
+//
+// WHY PRIOR FIXES FAILED:
+//   * Setting channel_mask=MAKE_CHANNEL_MASK(1) in audio_dev_src_start while
+//     leaving channel=1: the channel==1 branch (audio_codec_data_i2s.c:414-419)
+//     fires first and OVERWRITES the mask back to slot 0. No-op. (Failed fix #2,
+//     the channel_mask-only variant.)
+//   * Forcing channel=2 in audio_dev_src_start: desyncs esp_capture's own
+//     enable-state tracking against the duplex codec → "i2s_channel_disable:
+//     channel not enabled" + ~11 s reconnect loop. (Failed fix #2, reverted.)
+//   * Calling bsp_codec_set_fs AFTER the renderer was live: closed/reopened the
+//     record handle while TX was open → RX-disabled-while-TX-open → "AUD_SRC
+//     ret -8" dead mic. (Failed fix #1.)
+//
+// THE FIX — re-pin at the I2S-peripheral layer, the layer that actually decides
+// the slot, then restore the boot codec invariant (input_opened=true), WITHOUT
+// closing the codec under a live TX:
+//
+//   Step 1 (peripheral): disable the RX channel (i2s_channel_reconfig_std_slot
+//     requires READY/disabled state), re-apply the boot slot config
+//     (I2S_STD_SLOT_RIGHT), then re-enable it. This is byte-for-byte the boot
+//     sequence (board.c bsp_audio_init), so the slot is hardware-pinned RIGHT
+//     again regardless of what the prior session left behind.
+//   Step 2 (codec): reopen record_dev_handle the boot way (channel=2 +
+//     MAKE_CHANNEL_MASK(1)) so input_opened=true and the capturer's later
+//     channel=1 open hits the "Input already open" no-op and CANNOT remap to
+//     slot 0. We FIRST i2s_channel_enable() both channels (tolerating the
+//     benign "already enabled" return) so the codec's internal disable/enable
+//     in esp_codec_dev_open is valid from a known-enabled state, exactly like
+//     boot — this is what prevents the "i2s_channel_disable: channel not
+//     enabled" desync that bit the earlier reopen attempts.
+//
+// CRASH-SAFE on the reconnect JOIN path ONLY:
+//   - Runs after leave_room (close→settle→destroy) and media_cleanup, so NO
+//     peer_task / capture thread references the codec (avoids the leave_room
+//     subscribe-path panic).
+//   - The play (TX) codec handle is CLOSED at this point: av_render defers the
+//     play esp_codec_dev_open to the FIRST agent audio packet (av_render.c:957),
+//     and media_cleanup→av_render_close already closed it. So this never
+//     disables RX while TX is actively streaming → no "AUD_SRC ret -8".
+//   - It does NOT touch esp_capture / audio_dev_src state, so esp_capture's
+//     enable-state bookkeeping never desyncs.
+//   MUST be called BETWEEN media_init() and livekit_room_connect() on reconnect.
+void board_codec_reinit_record(void)
+{
+    // Step 1: re-apply the boot-time RIGHT slot directly at the i2s_std layer.
+    if (i2s_rx_chan != NULL) {
+        // i2s_channel_reconfig_std_slot() requires the channel be disabled
+        // (I2S_CHAN_STATE_READY). Disabling an already-disabled channel returns
+        // a benign ESP_ERR_INVALID_STATE — ignore it; we only care that the
+        // channel ends up disabled before the reconfig.
+        i2s_channel_disable(i2s_rx_chan);
+
+        i2s_std_config_t std_cfg = BSP_I2S_DUPLEX_MONO_CFG(DRV_AUDIO_SAMPLE_RATE);
+        std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT;  // slot 1 = the wired ES7243E ADC
+        esp_err_t slot_ret = i2s_channel_reconfig_std_slot(i2s_rx_chan, &std_cfg.slot_cfg);
+        if (slot_ret != ESP_OK) {
+            ESP_LOGW(TAG, "board_codec_reinit_record: RX slot reconfig failed (0x%x)", slot_ret);
+        }
+        // Re-enable RX so the codec reopen below starts from the boot-equivalent
+        // enabled state. "already enabled" is benign — ignore.
+        i2s_channel_enable(i2s_rx_chan);
+    }
+    // TX must also be enabled going into the codec reopen so esp_codec_dev_open's
+    // internal disable/enable on the OUT path is valid (boot-equivalent). Benign
+    // if already enabled.
+    if (i2s_tx_chan != NULL) {
+        i2s_channel_enable(i2s_tx_chan);
+    }
+
+    // Step 2: restore the boot codec invariant — record opened with channel=2 +
+    // MAKE_CHANNEL_MASK(1) leaves input_opened=true, so the capturer's later
+    // channel=1 open no-ops and cannot remap the slot back to LEFT.
+    esp_err_t ret = bsp_codec_set_fs(DRV_AUDIO_SAMPLE_RATE, DRV_AUDIO_SAMPLE_BITS, DRV_AUDIO_CHANNELS);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "board_codec_reinit_record: bsp_codec_set_fs failed (0x%x)", ret);
+    } else {
+        ESP_LOGI(TAG, "board_codec_reinit_record: re-pinned mic to RIGHT I2S slot (slot 1)");
+    }
 }
 
 esp_lcd_touch_handle_t bsp_touch_init(void)

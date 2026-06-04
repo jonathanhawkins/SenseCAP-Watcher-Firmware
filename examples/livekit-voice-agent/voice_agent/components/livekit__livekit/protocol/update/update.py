@@ -6,12 +6,7 @@ import shutil
 import subprocess
 import configparser
 
-required_files = [
-    "livekit_rtc.proto",
-    "livekit_models.proto",
-    "livekit_metrics.proto",
-    "logger/options.proto",
-]
+required_files = ["livekit_rtc.proto", "livekit_models.proto", "livekit_metrics.proto"]
 protobuf_location = "../protobufs"
 bindings_src_dest = "../"
 
@@ -65,9 +60,7 @@ def copy_proto_definitions(repo_root, dest):
     for fname in required_files:
         print("Copying " + fname)
         src = os.path.join(repo_root, "protobufs", fname)
-        dest_path = os.path.join(dest, fname)
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        shutil.copy2(src, dest_path)
+        shutil.copy2(src, dest)
 
 def unzip_file(srcfile, dest):
     with zipfile.ZipFile(srcfile, 'r') as zip_ref:

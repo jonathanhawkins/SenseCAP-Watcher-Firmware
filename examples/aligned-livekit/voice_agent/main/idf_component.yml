@@ -3,7 +3,12 @@ dependencies:
   livekit/example_utils:
     version: ~0.2.0
   livekit/livekit:
-    version: 0.3.4
+    version: "0.3.7"
+    # Use our LOCAL patched 0.3.7 copy (engine.c teardown-handshake + system.c
+    # audio core-pinning live inside it). override_path guarantees the build uses
+    # this copy and never silently downloads pristine 0.3.7 from the registry,
+    # which would drop those patches. See memory: watcher-livekit-component-dir-trap.
+    override_path: "../components/livekit__livekit"
   livekit/sandbox_token:
     version: ~0.1.0
   espressif/esp_codec_dev:

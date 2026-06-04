@@ -21,6 +21,11 @@ void request_start_meeting(void);
 void request_stop_meeting(void);
 void service_meeting_requests(void);
 
+// Plan-of-day picker: publish the knob-selected block id on the "plan_select"
+// data topic so the agent books it. Called from button_task on a short press
+// while ui_plan_is_active(). Hides the picker.
+void plan_confirm_selection(void);
+
 #ifdef __cplusplus
 }
 #endif

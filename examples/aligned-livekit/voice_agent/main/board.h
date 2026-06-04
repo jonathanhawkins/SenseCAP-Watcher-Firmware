@@ -19,6 +19,15 @@ float board_get_temp(void);
 /// Get record (microphone) handle
 esp_codec_dev_handle_t get_record_handle(void);
 
+/// Re-pin the ES7243E record ADC to its wired I2S slot (RIGHT / channel_mask
+/// bit 1) by re-running the boot-time codec close→set_gain→open sequence.
+/// MUST be called on the RECONNECT path AFTER media_init() and BEFORE the
+/// LiveKit room (esp_capture) starts the capturer. Without this, the capturer's
+/// channel=1 open is remapped by the I2S layer to slot 0 (LEFT, the UNWIRED
+/// silent channel) → the mic captures only noise floor (~peak 9-15) on every
+/// session after the first. Matches the working fresh-boot init exactly.
+void board_codec_reinit_record(void);
+
 /// Get playback (speaker) handle
 esp_codec_dev_handle_t get_playback_handle(void);
 

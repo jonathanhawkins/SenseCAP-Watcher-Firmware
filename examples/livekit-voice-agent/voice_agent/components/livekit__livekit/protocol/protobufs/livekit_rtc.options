@@ -43,24 +43,22 @@ livekit_pb.ParticipantUpdate.participants type:FT_POINTER
 livekit_pb.UpdateSubscription.track_sids type:FT_POINTER
 livekit_pb.UpdateSubscription.participant_tracks type:FT_IGNORE
 
-# CRITICAL: Cannot use FT_IGNORE on oneof fields - decoder needs wire type info to skip them
-# Using FT_CALLBACK allows proper skipping of these fields without storing data
-livekit_pb.SignalResponse.track_published type:FT_CALLBACK
-livekit_pb.SignalResponse.refresh_token type:FT_CALLBACK
-livekit_pb.SignalResponse.mute type:FT_CALLBACK
-livekit_pb.SignalResponse.speakers_changed type:FT_CALLBACK
-livekit_pb.SignalResponse.connection_quality type:FT_CALLBACK
-livekit_pb.SignalResponse.stream_state_update type:FT_CALLBACK
-livekit_pb.SignalResponse.subscribed_quality_update type:FT_CALLBACK
-livekit_pb.SignalResponse.subscription_permission_update type:FT_CALLBACK
-livekit_pb.SignalResponse.track_unpublished type:FT_CALLBACK
-livekit_pb.SignalResponse.reconnect type:FT_CALLBACK
-livekit_pb.SignalResponse.subscription_response type:FT_CALLBACK
-livekit_pb.SignalResponse.request_response type:FT_CALLBACK
-livekit_pb.SignalResponse.track_subscribed type:FT_CALLBACK
-livekit_pb.SignalResponse.room_moved type:FT_CALLBACK
-livekit_pb.SignalResponse.media_sections_requirement type:FT_CALLBACK
-livekit_pb.SignalResponse.subscribed_audio_codec_update type:FT_CALLBACK
+livekit_pb.SignalResponse.connection_quality type:FT_IGNORE
+livekit_pb.SignalResponse.subscription_permission_update type:FT_IGNORE
+livekit_pb.SignalResponse.track_published type:FT_IGNORE
+livekit_pb.SignalResponse.track_subscribed type:FT_IGNORE
+livekit_pb.SignalResponse.mute type:FT_IGNORE
+livekit_pb.SignalResponse.speakers_changed type:FT_IGNORE
+livekit_pb.SignalResponse.stream_state_update type:FT_IGNORE
+livekit_pb.SignalResponse.subscribed_quality_update type:FT_IGNORE
+livekit_pb.SignalResponse.refresh_token type:FT_IGNORE
+livekit_pb.SignalResponse.track_unpublished type:FT_IGNORE
+livekit_pb.SignalResponse.reconnect type:FT_IGNORE
+livekit_pb.SignalResponse.subscription_response type:FT_IGNORE
+livekit_pb.SignalResponse.request_response type:FT_IGNORE
+livekit_pb.SignalResponse.room_moved type:FT_IGNORE
+livekit_pb.SignalResponse.media_sections_requirement type:FT_IGNORE
+livekit_pb.SignalResponse.subscribed_audio_codec_update type:FT_IGNORE
 
 livekit_pb.JoinRequest.metadata type:FT_IGNORE
 livekit_pb.JoinRequest.participant_attributes type:FT_IGNORE

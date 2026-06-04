@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdlib.h>
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_wifi.h"
@@ -52,6 +53,20 @@ static bool s_agent_join_failed = false;
 // same handle → double-free corrupts the FreeRTOS timer list (uxListRemove
 // StoreProhibited crash, seen on meeting end 2026-05-22).
 static portMUX_TYPE s_watchdog_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Reconnect-stuck watchdog. The LiveKit SDK auto-reconnects on a dropped peer
+// (RECONNECTING state). If that loop never completes — the cloud agent left and
+// isn't coming back, or the media path is wedged — the device used to sit on
+// "Connecting…" FOREVER with the knob unresponsive (observed: a ~19-hour lock,
+// 2026-06-03). Bound it: if we stay in RECONNECTING past this, surface a retry
+// prompt. Recovery is the SAME crash-safe path as the agent-join watchdog —
+// flag the session dead + show retry; the actual leave_room() teardown is
+// deferred to the next knob hold (connect_room_internal's had_agent_failure
+// path), never run in the timer-service task. 25 s is generous vs LiveKit's own
+// reconnect budget so we don't cut a legitimately-recovering session.
+#define RECONNECT_TIMEOUT_MS 25000
+static TimerHandle_t s_reconnect_timer = NULL;   // also guarded by s_watchdog_mux
+static volatile bool s_reconnecting = false;     // true while SDK auto-reconnect is in flight
 
 static void agent_join_timer_cb(TimerHandle_t t)
 {
@@ -117,6 +132,74 @@ static void cancel_agent_join_timer(void)
     }
 }
 
+static void reconnect_timer_cb(TimerHandle_t t)
+{
+    (void)t;
+    // Race: CONNECTED may have fired in the gap between the timer firing and
+    // this callback running (it clears s_reconnecting). If so, do nothing.
+    // We check a BOOL, not livekit_room_get_state(room_handle) — dereferencing
+    // the handle here could race a concurrent leave_room() destroying it
+    // (use-after-free). This mirrors agent_join_timer_cb's bool-only check.
+    if (!s_reconnecting) {
+        ESP_LOGI(TAG, "Reconnect watchdog fired but already recovered; ignoring");
+        return;
+    }
+    ESP_LOGW(TAG, "Stuck reconnecting >%d ms — surfacing retry instead of a frozen screen",
+             RECONNECT_TIMEOUT_MS);
+    // Same crash-safe recovery as agent_join_timer_cb: do NOT call leave_room()
+    // here (it blocks 500 ms and races peer_task — must run on a normal task,
+    // not the timer-service task). Flag the session dead so room_is_active()
+    // returns false; the next knob hold runs connect_room_internal, whose
+    // had_agent_failure path tears the wedged handle down cleanly and reconnects.
+    s_agent_join_failed = true;
+    ui_set_voice_active(false);
+    ui_connection_failed("Connection lost — retry");
+}
+
+static void start_reconnect_timer(void)
+{
+    // Mirror start_agent_join_timer's mux discipline: claim+delete any old timer
+    // OUTSIDE the critical section, then create+start the new one.
+    TimerHandle_t old;
+    taskENTER_CRITICAL(&s_watchdog_mux);
+    old = s_reconnect_timer;
+    s_reconnect_timer = NULL;
+    taskEXIT_CRITICAL(&s_watchdog_mux);
+    if (old != NULL) {
+        xTimerStop(old, 0);
+        xTimerDelete(old, 0);
+    }
+
+    TimerHandle_t t = xTimerCreate(
+        "reconnect_wd",
+        pdMS_TO_TICKS(RECONNECT_TIMEOUT_MS),
+        pdFALSE,  // one-shot
+        NULL,
+        reconnect_timer_cb
+    );
+    if (t && xTimerStart(t, 0) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start reconnect watchdog");
+        xTimerDelete(t, 0);
+        t = NULL;
+    }
+    taskENTER_CRITICAL(&s_watchdog_mux);
+    s_reconnect_timer = t;
+    taskEXIT_CRITICAL(&s_watchdog_mux);
+}
+
+static void cancel_reconnect_timer(void)
+{
+    TimerHandle_t t;
+    taskENTER_CRITICAL(&s_watchdog_mux);
+    t = s_reconnect_timer;
+    s_reconnect_timer = NULL;
+    taskEXIT_CRITICAL(&s_watchdog_mux);
+    if (t != NULL) {
+        xTimerStop(t, 0);
+        xTimerDelete(t, 0);
+    }
+}
+
 /// Map a LiveKit failure-reason enum to a brief user-facing string.
 /// Keep messages ≤24 chars so they wrap cleanly on the 412 px round screen.
 static const char *describe_livekit_failure(livekit_failure_reason_t r)
@@ -147,6 +230,8 @@ static void on_state_changed(livekit_connection_state_t state, void *ctx)
     {
         case LIVEKIT_CONNECTION_STATE_CONNECTED:
             ESP_LOGI(TAG, "✅ Connected to LiveKit room!");
+            s_reconnecting = false;
+            cancel_reconnect_timer();  // reconnect completed (or never was reconnecting)
             if (s_meeting_mode) {
                 // Silent meeting: show the recording/transcript screen instead
                 // of the conversational listening orb + "hold to disconnect".
@@ -160,11 +245,21 @@ static void on_state_changed(livekit_connection_state_t state, void *ctx)
             start_agent_join_timer();
             break;
         case LIVEKIT_CONNECTION_STATE_CONNECTING:
+            ui_wifi_connecting();  // Show connecting state (initial connect)
+            break;
         case LIVEKIT_CONNECTION_STATE_RECONNECTING:
-            ui_wifi_connecting();  // Show connecting state
+            // Auto-reconnect in flight. Bound it — without this the device used
+            // to wedge here forever (frozen "Connecting…", knob dead → 19h lock).
+            ESP_LOGI(TAG, "Auto-reconnecting; arming %d ms recovery watchdog", RECONNECT_TIMEOUT_MS);
+            s_reconnecting = true;
+            ui_wifi_connecting();
+            start_reconnect_timer();
             break;
         case LIVEKIT_CONNECTION_STATE_DISCONNECTED:
             cancel_agent_join_timer();
+            cancel_reconnect_timer();
+            s_reconnecting = false;
+            ui_plan_hide();              // dismiss the plan picker if it was up
             ui_set_voice_active(false);  // Update status bar: voice inactive
             if (s_meeting_mode) {
                 // End the meeting screen and return to the home wallpaper.
@@ -176,6 +271,8 @@ static void on_state_changed(livekit_connection_state_t state, void *ctx)
         case LIVEKIT_CONNECTION_STATE_FAILED:
             ESP_LOGE(TAG, "❌ Connection failed!");
             cancel_agent_join_timer();
+            cancel_reconnect_timer();
+            s_reconnecting = false;
             ui_set_voice_active(false);  // Update status bar: voice inactive
             // Show a user-readable failure reason. The room handle is left in
             // place so livekit_room_get_failure_reason() works; join_room()
@@ -256,53 +353,124 @@ static void on_data_received(const livekit_data_received_t *data, void *ctx)
         return;
     }
 
-    // Meeting-mode data channels: transcript lines (topic "transcription",
-    // type "meeting_transcript") and coach cards (topic "coach"). Ignored
-    // outside a meeting so voice-mode "transcription" packets (memory tool
-    // debug events) don't render anything.
-    if (!s_meeting_mode) {
-        return;
-    }
+    // Topics parsed as JSON: "transcription" carries voice-mode artifacts (the
+    // plan-of-day picker) AND meeting transcript lines; "coach" carries meeting
+    // coach cards. Anything else is ignored. NOTE: this is no longer gated on
+    // s_meeting_mode up front — the plan picker is a VOICE-mode feature.
     bool is_transcript = (strcmp(data->topic, "transcription") == 0);
-    bool is_coach = (strcmp(data->topic, "coach") == 0);
+    bool is_coach      = (strcmp(data->topic, "coach") == 0);
     if (!is_transcript && !is_coach) {
         return;
     }
 
-    // Copy payload to a bounded, null-terminated buffer for cJSON.
+    // Copy payload to a bounded, null-terminated heap buffer for cJSON. The
+    // plan artifact (scheduledBlocks + summary) is larger than a transcript
+    // line, so the cap is generous; oversized payloads truncate at a UTF-8
+    // boundary (a mangled tail just fails cJSON_Parse → no-op, no crash).
     size_t n = data->payload.size;
     if (n == 0) return;
-    if (n > 768) {
-        n = 768;  // cap — transcript lines / coach text are short
-        // Back off to a UTF-8 codepoint boundary so we don't truncate mid-
-        // sequence (would render a tofu glyph). Continuation bytes are 10xxxxxx (L1).
+    if (n > 8192) {
+        n = 8192;
         const uint8_t *pb = (const uint8_t *)data->payload.bytes;
         while (n > 0 && (pb[n] & 0xC0) == 0x80) n--;
     }
-    char buf[769];
+    char *buf = (char *)malloc(n + 1);
+    if (buf == NULL) return;
     memcpy(buf, data->payload.bytes, n);
     buf[n] = '\0';
 
     cJSON *obj = cJSON_Parse(buf);
+    free(buf);
     if (obj == NULL) {
         return;
     }
     cJSON *type = cJSON_GetObjectItem(obj, "type");
     const char *type_str = (type && cJSON_IsString(type)) ? type->valuestring : "";
 
-    if (is_transcript && strcmp(type_str, "meeting_transcript") == 0) {
-        cJSON *text = cJSON_GetObjectItem(obj, "text");
-        if (text && cJSON_IsString(text) && strlen(text->valuestring) > 0) {
-            ui_meeting_transcript_line(text->valuestring);
+    // Voice-mode plan-of-day picker: "show_artifact" envelope with artifact_kind
+    // "voice-plan-day" (agent plan_my_day → publish_artifact). Render the
+    // proposed focus blocks as a knob-selectable list. Works in voice mode.
+    if (is_transcript && strcmp(type_str, "show_artifact") == 0) {
+        cJSON *kind = cJSON_GetObjectItem(obj, "artifact_kind");
+        const char *kind_str = (kind && cJSON_IsString(kind)) ? kind->valuestring : "";
+        if (strcmp(kind_str, "voice-plan-day") == 0) {
+            cJSON *adata  = cJSON_GetObjectItem(obj, "artifact_data");
+            cJSON *blocks = adata ? cJSON_GetObjectItem(adata, "scheduledBlocks") : NULL;
+            if (blocks && cJSON_IsArray(blocks)) {
+                ui_plan_block_t rows[6];
+                int rc = 0;
+                cJSON *b = NULL;
+                cJSON_ArrayForEach(b, blocks) {
+                    if (rc >= 6) break;
+                    cJSON *jid    = cJSON_GetObjectItem(b, "id");
+                    cJSON *jlabel = cJSON_GetObjectItem(b, "startLabel");
+                    cJSON *jtitle = cJSON_GetObjectItem(b, "taskSummary");
+                    cJSON *jbreak = cJSON_GetObjectItem(b, "isBreak");
+                    // Skip break rows — only bookable focus/meeting blocks.
+                    if (jbreak && cJSON_IsBool(jbreak) && cJSON_IsTrue(jbreak)) continue;
+                    const char *idv = (jid && cJSON_IsString(jid)) ? jid->valuestring : "";
+                    if (idv[0] == '\0') continue;  // need an id to round-trip
+                    rows[rc].id    = idv;
+                    rows[rc].label = (jlabel && cJSON_IsString(jlabel)) ? jlabel->valuestring : "";
+                    rows[rc].title = (jtitle && cJSON_IsString(jtitle)) ? jtitle->valuestring : "";
+                    rc++;
+                }
+                if (rc > 0) {
+                    ui_plan_show(rows, rc);  // strings valid until cJSON_Delete below
+                }
+            }
         }
-    } else if (is_coach && strcmp(type_str, "coach_suggestion") == 0) {
-        cJSON *display = cJSON_GetObjectItem(obj, "display_text");
-        if (display && cJSON_IsString(display) && strlen(display->valuestring) > 0) {
-            ui_meeting_coach_card(display->valuestring);
+        cJSON_Delete(obj);
+        return;
+    }
+
+    // Meeting-mode data channels (only while a silent meeting is active).
+    if (s_meeting_mode) {
+        if (is_transcript && strcmp(type_str, "meeting_transcript") == 0) {
+            cJSON *text = cJSON_GetObjectItem(obj, "text");
+            if (text && cJSON_IsString(text) && strlen(text->valuestring) > 0) {
+                ui_meeting_transcript_line(text->valuestring);
+            }
+        } else if (is_coach && strcmp(type_str, "coach_suggestion") == 0) {
+            cJSON *display = cJSON_GetObjectItem(obj, "display_text");
+            if (display && cJSON_IsString(display) && strlen(display->valuestring) > 0) {
+                ui_meeting_coach_card(display->valuestring);
+            }
         }
     }
 
     cJSON_Delete(obj);
+}
+
+// Publish the user's knob-selected plan block id on the "plan_select" data
+// topic. The agent (agent.py on_data_received) books that block and speaks a
+// confirmation. Called from button_task on a short knob press while the plan
+// picker is showing (see main.c).
+void plan_confirm_selection(void)
+{
+    const char *id = ui_plan_get_selected_id();
+    ui_plan_hide();
+    if (id == NULL || id[0] == '\0' || room_handle == NULL) {
+        return;
+    }
+    char json[96];
+    int len = snprintf(json, sizeof(json), "{\"selected_block_id\":\"%s\"}", id);
+    if (len <= 0 || len >= (int)sizeof(json)) {
+        return;
+    }
+    livekit_data_payload_t payload = {
+        .bytes = (uint8_t *)json,
+        .size  = (size_t)len,
+    };
+    livekit_data_publish_options_t options = {
+        .payload = &payload,
+        .topic   = "plan_select",
+        .lossy   = false,
+        .destination_identities = NULL,
+        .destination_identities_count = 0,
+    };
+    livekit_err_t err = livekit_room_publish_data(room_handle, &options);
+    ESP_LOGI(TAG, "plan_select published (id=%s) err=%d", id, (int)err);
 }
 
 /// Invoked by a remote participant to set the state of an on-board LED.
@@ -356,6 +524,8 @@ static void connect_room_internal(bool meeting)
     bool had_agent_failure = s_agent_join_failed;
     s_agent_join_failed = false;
     agent_joined = false;
+    s_reconnecting = false;
+    cancel_reconnect_timer();  // clear any stuck-reconnect watchdog from a prior wedge
 
     // If a previous attempt left a stale handle in FAILED/DISCONNECTED state,
     // tear it down so we can re-create cleanly. (room_is_active() now ignores
@@ -423,6 +593,29 @@ static void connect_room_internal(bool meeting)
         ESP_LOGI(TAG, "Reconnect: full media re-init (capturer + renderer) for a clean duplex I2S cycle");
         media_cleanup();
         media_init();
+        // RIGHT-slot re-pin for the mic. After a disconnect, the LiveKit teardown
+        // closed the record codec (input_opened=false), so on reconnect the
+        // capturer's channel=1 codec open runs set_fmt and the I2S data-if
+        // UNCONDITIONALLY remaps a mono open to slot 0 = LEFT = the unwired,
+        // SILENT slot (audio_codec_data_i2s.c:414-419). board_codec_reinit_record()
+        // fixes this at the I2S-peripheral level: it re-applies the boot slot
+        // config (I2S_STD_SLOT_RIGHT) directly on the RX channel AND reopens the
+        // record handle the boot way (channel=2 + MAKE_CHANNEL_MASK(1)) so
+        // input_opened=true → the capturer's later channel=1 open hits the
+        // "Input already open" no-op and can't remap the slot back to LEFT.
+        //
+        // Safe HERE (between media_init and livekit_room_connect) but NOT after
+        // the renderer is live: the play/TX codec handle is still CLOSED at this
+        // point (av_render defers its esp_codec_dev_open to the first agent audio
+        // packet), so we never disable RX while TX is streaming → no "AUD_SRC
+        // ret -8". The earlier reverted attempt called bsp_codec_set_fs AFTER the
+        // renderer was up, which is what produced the -8. Setting the slot in the
+        // esp_capture source channel_mask was ALSO tried and reverted: the
+        // channel==1 branch in the data-if overwrites it (no-op), and forcing
+        // channel=2 there desyncs esp_capture's enable tracking → an
+        // "i2s_channel_disable: channel not enabled" reconnect loop. See
+        // board_codec_reinit_record() for the full root-cause writeup.
+        board_codec_reinit_record();
     }
 
     // Guard: if media init/reset failed, the capturer and/or renderer is NULL.
@@ -542,9 +735,11 @@ void leave_room()
     livekit_room_handle_t handle = room_handle;
     room_handle = NULL;  /* Clear immediately to prevent re-entry via room_is_active() */
 
-    // Cancel any in-flight agent-join watchdog + reset the failure flag.
+    // Cancel any in-flight watchdogs + reset the failure flags.
     // We're tearing down the room regardless of why; the next attempt starts fresh.
     cancel_agent_join_timer();
+    cancel_reconnect_timer();
+    s_reconnecting = false;
     s_agent_join_failed = false;
     agent_joined = false;
 

@@ -7,7 +7,9 @@
 #include "esp_capture_defaults.h"
 #include "esp_capture_sink.h"
 #include "esp_capture_audio_dev_src.h"
+#include "esp_capture_audio_src_if.h"
 #include "esp_codec_dev.h"
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "freertos/task.h"
@@ -43,6 +45,126 @@ static renderer_system_t renderer_system;
 // stack overflow during ICE → reboot). The Adec/ARender core pinning lives in
 // system.c for exactly this reason.
 
+// ───────────────────────────────────────────────────────────────────────────
+// Half-duplex echo gate (PCM frame-zeroing)
+//
+// While the agent is speaking we ZERO the captured PCM before it is published,
+// so the agent never hears its own voice through the speaker. The codec keeps
+// streaming real frames (we only overwrite the bytes after a successful read),
+// so unlike a codec/digital mute this can NEVER trigger the "AUD_SRC ret -8"
+// deaf failure (see the banner on media_set_mic_muted).
+//
+// Why this and not just the −27 dB PGA attenuation or a higher xAI VAD
+// threshold: verified 2026-06-02 against the live local agent log that even at
+// VAD threshold 0.9 the −27 dB residual echo still tripped xAI's server VAD
+// (a flood of user_input_transcribed while the agent spoke → it answered
+// itself). Zeroing the samples is the only thing that removes the echo entirely.
+//
+// Tradeoff: the user cannot barge-in while the agent speaks (their voice is
+// zeroed too). The 300 ms unmute drain (media_set_mic_muted) keeps the agent's
+// own tail from leaking back after it stops.
+// ───────────────────────────────────────────────────────────────────────────
+static volatile bool s_mic_gate_muted = false;
+
+// Passthrough wrapper around the raw codec dev-src. `base` MUST be first so
+// esp_capture's (esp_capture_audio_src_if_t *) IS a (mic_gate_src_t *).
+typedef struct {
+    esp_capture_audio_src_if_t  base;
+    esp_capture_audio_src_if_t *inner;
+} mic_gate_src_t;
+
+static mic_gate_src_t s_mic_gate;
+
+#define GATE_INNER(s) (((mic_gate_src_t *)(s))->inner)
+
+static esp_capture_err_t gate_open(esp_capture_audio_src_if_t *s) {
+    esp_capture_audio_src_if_t *in = GATE_INNER(s);
+    return in->open ? in->open(in) : ESP_CAPTURE_ERR_OK;
+}
+static esp_capture_err_t gate_get_support_codecs(esp_capture_audio_src_if_t *s, const esp_capture_format_id_t **codecs, uint8_t *num) {
+    esp_capture_audio_src_if_t *in = GATE_INNER(s);
+    return in->get_support_codecs ? in->get_support_codecs(in, codecs, num) : ESP_CAPTURE_ERR_OK;
+}
+static esp_capture_err_t gate_set_fixed_caps(esp_capture_audio_src_if_t *s, const esp_capture_audio_info_t *caps) {
+    esp_capture_audio_src_if_t *in = GATE_INNER(s);
+    return in->set_fixed_caps ? in->set_fixed_caps(in, caps) : ESP_CAPTURE_ERR_OK;
+}
+static esp_capture_err_t gate_negotiate_caps(esp_capture_audio_src_if_t *s, esp_capture_audio_info_t *in_caps, esp_capture_audio_info_t *out_caps) {
+    esp_capture_audio_src_if_t *in = GATE_INNER(s);
+    return in->negotiate_caps ? in->negotiate_caps(in, in_caps, out_caps) : ESP_CAPTURE_ERR_OK;
+}
+static esp_capture_err_t gate_start(esp_capture_audio_src_if_t *s) {
+    esp_capture_audio_src_if_t *in = GATE_INNER(s);
+    return in->start ? in->start(in) : ESP_CAPTURE_ERR_OK;
+}
+// Digital make-up gain applied to the captured mic AFTER the ES7243E analog PGA.
+// Why: the ES7243E analog PGA is at its ~37 dB ceiling (init sets +30, get_db_reg
+// caps ~37) yet far-field voice still captures at only ~peak 1300 / meanabs ~50
+// (verified micdbg 2026-06-04) — too quiet for xAI's server-VAD to register a
+// turn, so the agent never hears the user. SNR is fine (~16-23 dB), so a digital
+// multiply raises the absolute level without a noise problem. ×8 brings sustained
+// speech (~meanabs 50-290) to ~400-2300 and peaks to ~10k, well into VAD range,
+// with clamping so loud syllables saturate gracefully instead of wrapping.
+#define MIC_DIGITAL_GAIN (8)
+
+static esp_capture_err_t gate_read_frame(esp_capture_audio_src_if_t *s, esp_capture_stream_frame_t *frame) {
+    esp_capture_audio_src_if_t *in = GATE_INNER(s);
+    esp_capture_err_t err = in->read_frame ? in->read_frame(in, frame) : ESP_CAPTURE_ERR_OK;
+    if (err == ESP_CAPTURE_ERR_OK && frame != NULL && frame->data != NULL && frame->size >= 2) {
+        int16_t *pcm = (int16_t *)frame->data;
+        size_t n = (size_t)frame->size / 2;
+        if (s_mic_gate_muted) {
+            // Agent is speaking → publish digital silence so it can't hear itself.
+            memset(frame->data, 0, (size_t)frame->size);
+        } else {
+            // User's turn → apply digital make-up gain (clamped) so the quiet
+            // far-field capture reaches a VAD-detectable level.
+            for (size_t i = 0; i < n; i++) {
+                int32_t v = (int32_t)pcm[i] * MIC_DIGITAL_GAIN;
+                if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+                pcm[i] = (int16_t)v;
+            }
+        }
+        // micdbg: log the FINAL published amplitude (~1×/50 frames) — peak in the
+        // thousands when the user speaks = audible to the agent; tens = still dead.
+        static uint32_t s_dbg_cnt = 0;
+        if ((s_dbg_cnt++ % 50) == 0) {
+            int32_t peak = 0; int64_t suma = 0;
+            for (size_t i = 0; i < n; i++) {
+                int32_t a = pcm[i] < 0 ? -(int32_t)pcm[i] : (int32_t)pcm[i];
+                if (a > peak) peak = a;
+                suma += a;
+            }
+            ESP_LOGI(TAG, "micdbg published peak=%ld meanabs=%ld muted=%d xgain=%d n=%u",
+                     (long)peak, (long)(n ? suma / (int64_t)n : 0), (int)s_mic_gate_muted,
+                     (int)MIC_DIGITAL_GAIN, (unsigned)n);
+        }
+    }
+    return err;
+}
+static esp_capture_err_t gate_stop(esp_capture_audio_src_if_t *s) {
+    esp_capture_audio_src_if_t *in = GATE_INNER(s);
+    return in->stop ? in->stop(in) : ESP_CAPTURE_ERR_OK;
+}
+static esp_capture_err_t gate_close(esp_capture_audio_src_if_t *s) {
+    esp_capture_audio_src_if_t *in = GATE_INNER(s);
+    return in->close ? in->close(in) : ESP_CAPTURE_ERR_OK;
+}
+
+// Wrap `inner` with the gate. Single static instance (re-wraps on reconnect).
+static esp_capture_audio_src_if_t *mic_gate_wrap(esp_capture_audio_src_if_t *inner) {
+    s_mic_gate.inner                   = inner;
+    s_mic_gate.base.open               = gate_open;
+    s_mic_gate.base.get_support_codecs = gate_get_support_codecs;
+    s_mic_gate.base.set_fixed_caps     = gate_set_fixed_caps;
+    s_mic_gate.base.negotiate_caps     = gate_negotiate_caps;
+    s_mic_gate.base.start              = gate_start;
+    s_mic_gate.base.read_frame         = gate_read_frame;
+    s_mic_gate.base.stop               = gate_stop;
+    s_mic_gate.base.close              = gate_close;
+    return &s_mic_gate.base;
+}
+
 static int build_capturer_system(void)
 {
     ESP_LOGI(TAG, "Building capturer system...");
@@ -62,7 +184,13 @@ static int build_capturer_system(void)
     capturer_system.audio_source = esp_capture_new_audio_dev_src(&codec_cfg);
     NULL_CHECK(capturer_system.audio_source, "Failed to create audio source");
 
-    esp_capture_cfg_t cfg = { .sync_mode = ESP_CAPTURE_SYNC_MODE_AUDIO, .audio_src = capturer_system.audio_source };
+    // Wrap the raw codec source with the half-duplex gate so we can ZERO the
+    // published PCM while the agent is speaking — echo suppression that can't go
+    // deaf (the codec keeps streaming). See the mic-gate banner above.
+    esp_capture_audio_src_if_t *gated_src = mic_gate_wrap(capturer_system.audio_source);
+    NULL_CHECK(gated_src, "Failed to wrap audio source");
+
+    esp_capture_cfg_t cfg = { .sync_mode = ESP_CAPTURE_SYNC_MODE_AUDIO, .audio_src = gated_src };
     esp_capture_open(&cfg, &capturer_system.capturer_handle);
     NULL_CHECK(capturer_system.capturer_handle, "Failed to open capture system");
     ESP_LOGI(TAG, "Capturer system initialized successfully");
@@ -215,16 +343,32 @@ av_render_handle_t media_get_renderer(void)
 // which the capture reader can't survive. Changing only the analog PGA gain
 // (set_in_gain → REG16) keeps the I2S stream flowing, so it's the only
 // capture-safe lever — but 27 dB attenuation is NOT enough to fully suppress the
-// speaker echo under xAI's server-side VAD. Real echo suppression must happen
-// DOWNSTREAM of the codec (drop/zero the published audio while the agent speaks),
-// handled agent-side — see media_set_mic_muted() callers + agent.py. This stays
-// as a cheap extra attenuation that can never go deaf.
-#define MIC_ACTIVE_GAIN_DB  (27.0f)
+// speaker echo under xAI's server-side VAD (verified 2026-06-02 against the live
+// local agent log: even at VAD threshold 0.9 the residual echo still tripped
+// turns → the agent answered itself). Real echo suppression happens DOWNSTREAM of
+// the codec by ZEROING the published PCM while the agent speaks — implemented in
+// firmware by the mic-gate wrapper above (s_mic_gate_muted / gate_read_frame),
+// driven by this same mute signal. This gain drop stays as a cheap extra.
+// 36 dB active (was 27, which the ES8311 quantized DOWN to its 24 dB step —
+// gain steps are 0/6/12/18/24/30/36/42). At 24 dB the far-field voice barely
+// cleared the noise floor: verified 2026-06-04 via micdbg that the captured
+// mic peaked only ~1445 (mostly ~40–160 = noise) while the user spoke → xAI
+// never got a usable turn → "I'm talking and it's not responding". 36 dB is a
+// real +12 dB (~4x) so normal speech captures at ~5–6k peak, well above noise.
+// Echo is NOT a concern at higher gain: it's killed by the PCM frame-zeroing
+// while the agent speaks (independent of gain), and muted still drops to 0 dB.
+#define MIC_ACTIVE_GAIN_DB  (36.0f)
 #define MIC_MUTED_GAIN_DB   (0.0f)
 static TimerHandle_t s_unmute_timer = NULL;
 
 static void apply_codec_mute(bool muted)
 {
+    // Drive the PCM-zeroing gate first — this is the REAL echo suppression (the
+    // gain change below is just a cheap extra). It inherits the asymmetric timing
+    // of media_set_mic_muted (immediate on "speaking", 300 ms-deferred on
+    // "listening") because that path calls this fn at both edges.
+    s_mic_gate_muted = muted;
+
     esp_codec_dev_handle_t record_handle = get_record_handle();
     if (record_handle == NULL) {
         return;
@@ -248,12 +392,14 @@ static void unmute_timer_cb(TimerHandle_t t)
 
 void media_set_mic_muted(bool muted)
 {
-    // Hardware-level mute at the codec — when muted, the I2S input stream
-    // delivers silence regardless of what's happening at the mic. We use
-    // this for half-duplex echo suppression while the agent is speaking
-    // (the agent.py side publishes data-channel "speaking"/"listening"
-    // events; example.c::on_data_received drives this). Without AEC this
-    // is what keeps the agent from hearing itself.
+    // Half-duplex echo suppression while the agent is speaking. Despite the
+    // name this does NOT mute the codec (a codec mute kills capture → deaf;
+    // see the apply_codec_mute banner). Via apply_codec_mute() it does two
+    // capture-safe things: (1) sets s_mic_gate_muted so gate_read_frame ZEROES
+    // the published PCM (the real suppression), and (2) drops the analog PGA
+    // gain to its floor (cheap extra). Driven by the agent's data-channel
+    // "speaking"/"listening" events (example.c::on_data_received). Without AEC
+    // this is what keeps the agent from hearing itself.
     //
     // Asymmetric timing: MUTE is applied immediately (don't want to miss
     // the start of the agent's utterance). UN-mute is DELAYED so the

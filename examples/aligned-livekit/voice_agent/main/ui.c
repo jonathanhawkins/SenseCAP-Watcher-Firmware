@@ -60,6 +60,7 @@ static void update_battery_status(void);
 static void create_hint_label(void);
 static void update_hint_label(void);
 static void create_meeting_button(void);
+static void meeting_button_set_enabled_locked(bool enabled);
 static void meeting_btn_event_cb(lv_event_t *e);
 static void meeting_end_btn_event_cb(lv_event_t *e);
 static void show_home_chrome_locked(void);  // home buttons/status bar; assumes LVGL lock held
@@ -341,6 +342,13 @@ void ui_wifi_connecting(void)
     // the Aligned-logo background of the home screen. The user wants only the
     // boot text gone, not the wallpaper.
     if (label) lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+
+    // Grey OUT the on-screen meeting (mic) button the moment a session starts
+    // connecting. While a LiveKit voice session is up, the user must not be
+    // able to tap the mic button and start a meeting recording. We dim +
+    // disable (not destroy) — the widget is reused; ui_set_voice_active(false)
+    // re-enables it on disconnect/failure. NULL-safe inside the helper.
+    meeting_button_set_enabled_locked(false);
 
     // Pulse the voice-call icon while we're connecting. Tear-safe
     // opacity animation only (no spatial motion — see watcher-ui.md).
@@ -706,6 +714,16 @@ void ui_set_voice_active(bool active)
 {
     lvgl_port_lock(0);
     s_voice_active = active;
+
+    // The on-screen meeting (mic) button tracks the INVERSE of voice-active:
+    // while a live voice agent session is up it's greyed out + disabled so the
+    // user can't accidentally start a meeting recording from inside the
+    // session; on disconnect / failure it's re-enabled. The widget is reused
+    // (watcher-ui.md), and in meeting mode this path isn't the one that owns
+    // the button (ui_meeting_start/end hide it), so the NULL-checked toggle is
+    // safe either way.
+    meeting_button_set_enabled_locked(!active);
+
     // Stop the connecting-pulse on EITHER transition: success (active=true)
     // moves us to the steady green state, failure/disconnect (active=false)
     // restores the steady grey state.
@@ -875,16 +893,19 @@ void ui_knob_hold_start(void)
     //   - Voice room active (CONNECTING / RECONNECTING / CONNECTED):
     //     hint reads "Hold to disconnect..." — release at 1.75 s drops
     //     the room, release at 5 s+ goes to deep sleep instead.
-    //   - Idle home (no room): hint reads "Hold for sleep..." — release
-    //     under 5 s is a no-op, release at 5 s+ goes to deep sleep.
-    // Both contexts get a progress bar so the long press has visible
-    // feedback. (Earlier this function early-returned when the room
-    // wasn't active, leaving idle-screen sleep holds with no UI feedback
-    // at all until "Goodbye" appeared.)
+    //   - Idle home (no room): hint reads "Hold to connect..." — release
+    //     under 1 s is a no-op (anti-accidental), release at 1 s+ joins the
+    //     room, release at 5 s+ goes to deep sleep. button_task drives the
+    //     connect -> sleep transition via ui_knob_hold_ready_connect() and
+    //     ui_knob_hold_enter_sleep_phase().
+    // Both contexts get a progress bar so the hold has visible feedback.
+    // (Earlier this function early-returned when the room wasn't active,
+    // leaving idle-screen holds with no UI feedback at all until "Goodbye"
+    // appeared.)
     lvgl_port_lock(0);
     if (!s_disconnecting && hint_label) {
         const bool room_active = room_is_active();
-        lv_label_set_text(hint_label, room_active ? "Hold to disconnect..." : "Hold for sleep...");
+        lv_label_set_text(hint_label, room_active ? "Hold to disconnect..." : "Hold to connect...");
         lv_obj_set_style_text_color(hint_label, lv_color_hex(0xFFFFFF), 0); // white = "we see you"
         lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(hint_label);
@@ -1010,6 +1031,62 @@ void ui_knob_hold_ready_sleep(void)
         if (knob_progress_bar) {
             lv_bar_set_value(knob_progress_bar, 100, LV_ANIM_OFF);
             lv_obj_set_style_bg_color(knob_progress_bar, lv_color_hex(0xFFB300), LV_PART_INDICATOR);
+        }
+    }
+    lvgl_port_unlock();
+}
+
+void ui_knob_hold_ready_connect(void)
+{
+    // Idle home only. Fired by button_task when the hold crosses
+    // BUTTON_CONNECT_MS (1 s). The join itself runs on release, so the user
+    // needs to know they can let go NOW to connect — otherwise they keep
+    // holding and overshoot toward sleep. Green = "good, go ahead", the same
+    // token ui_knob_hold_ready_disconnect() uses for its release cue.
+    if (room_is_active()) {
+        return;  // disconnect/sleep flow owns the hint when a room is up
+    }
+    lvgl_port_lock(0);
+    if (!s_disconnecting && hint_label) {
+        lv_label_set_text(hint_label, "Release to connect");
+        lv_obj_set_style_text_color(hint_label, lv_color_hex(0x4CAF50), 0); // green
+        lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(hint_label);
+
+        // Bar reaches the connect threshold — pin full + green to mirror text.
+        if (knob_progress_bar) {
+            lv_bar_set_value(knob_progress_bar, 100, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(knob_progress_bar, lv_color_hex(0x4CAF50), LV_PART_INDICATOR);
+        }
+    }
+    lvgl_port_unlock();
+}
+
+void ui_knob_hold_enter_sleep_phase(void)
+{
+    // Idle home only. Fired once by button_task after the green
+    // "Release to connect" dwell, when a hold continues past
+    // BUTTON_CONNECT_MS + BUTTON_CONNECT_DWELL_MS on its way to the 5 s sleep
+    // threshold. This is the visible hand-off from the connect gesture to the
+    // sleep gesture: swap the hint to amber "Keep holding for sleep..." and
+    // reset the bar to empty amber so ui_knob_hold_progress() can refill it
+    // toward sleep. (A release before 5 s still connects — see button_task.)
+    if (room_is_active()) {
+        return;
+    }
+    lvgl_port_lock(0);
+    if (!s_disconnecting && hint_label) {
+        lv_label_set_text(hint_label, "Keep holding for sleep...");
+        lv_obj_set_style_text_color(hint_label, lv_color_hex(0xFFB300), 0); // amber
+        lv_obj_clear_flag(hint_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(hint_label);
+
+        // Restart the fill from empty in amber — the refill is the countdown
+        // toward sleep. ui_knob_hold_progress() keeps the colour as it advances.
+        if (knob_progress_bar) {
+            lv_obj_set_style_bg_color(knob_progress_bar, lv_color_hex(0xFFB300), LV_PART_INDICATOR);
+            lv_bar_set_value(knob_progress_bar, 0, LV_ANIM_OFF);
+            lv_obj_clear_flag(knob_progress_bar, LV_OBJ_FLAG_HIDDEN);
         }
     }
     lvgl_port_unlock();
@@ -1278,6 +1355,35 @@ static void create_meeting_button(void)
     ESP_LOGI(TAG, "Live Meeting button created");
 }
 
+/**
+ * @brief Enable / grey-out the home-screen meeting (mic) button.
+ *
+ * Disabled state: dim the whole button to ~40% opacity (the LV_PART_MAIN opa
+ * cascades to the mic-icon child too) and clear LV_OBJ_FLAG_CLICKABLE so it
+ * gives no press feedback and fires no CLICKED event. This is how the button
+ * is turned off while a live voice-agent session is up, so a stray tap can't
+ * start a meeting recording. The functional guard in
+ * example.c::service_meeting_requests() (skips start_meeting() when
+ * room_is_active()) remains as the backstop.
+ *
+ * Caller MUST already hold lvgl_port_lock — both call sites (ui_wifi_connecting,
+ * ui_set_voice_active) are inside the lock. NULL-safe: meeting_btn isn't
+ * created until the first idle-home render.
+ */
+static void meeting_button_set_enabled_locked(bool enabled)
+{
+    if (meeting_btn == NULL) {
+        return;
+    }
+    if (enabled) {
+        lv_obj_add_flag(meeting_btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_opa(meeting_btn, LV_OPA_COVER, LV_PART_MAIN);
+    } else {
+        lv_obj_clear_flag(meeting_btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_opa(meeting_btn, LV_OPA_40, LV_PART_MAIN); // ~40% = clearly dimmed
+    }
+}
+
 static void stop_rec_anim(void)
 {
     if (s_rec_anim_active && meeting_rec_label) {
@@ -1517,4 +1623,219 @@ void ui_meeting_end(void)
     show_home_chrome_locked();
 
     lvgl_port_unlock();
+}
+
+//=============================================================================
+// Plan-of-the-day picker
+//
+// Knob-selectable list of proposed time blocks, overlaid on the home orb.
+// Driven by the agent's "voice-plan-day" artifact (example.c::on_data_received).
+// Rotation moves the highlight (volume_control.c), a short knob press confirms
+// (main.c button_task -> plan_confirm_selection() in example.c).
+//
+// watcher-ui.md compliance: overlays via LV_OBJ_FLAG_HIDDEN (never lv_obj_clean
+// — the orb is wallpaper); fixed row layout (no spatially-moving geometry, so
+// no tearing); capped rows + NULL-checked widgets (32 KB LVGL heap); selection
+// is an in-place style change, not a moving cursor.
+//=============================================================================
+#define PLAN_MAX_ROWS 6
+
+static lv_obj_t *plan_panel = NULL;
+static lv_obj_t *plan_rows[PLAN_MAX_ROWS] = {0};
+static lv_obj_t *plan_row_labels[PLAN_MAX_ROWS] = {0};
+static lv_timer_t *plan_autohide_timer = NULL;
+static char plan_ids[PLAN_MAX_ROWS][64];
+static int plan_count = 0;
+static int plan_sel = 0;
+static bool s_plan_active = false;
+
+// Restyle rows so the selected one is highlighted. Caller holds the LVGL lock.
+static void plan_restyle_rows_locked(void)
+{
+    for (int i = 0; i < plan_count; i++) {
+        if (!plan_rows[i]) continue;
+        bool sel = (i == plan_sel);
+        lv_obj_set_style_bg_color(plan_rows[i], sel ? lv_color_hex(0x2E7D32) : lv_color_hex(0x2A2A2A), 0);
+        lv_obj_set_style_border_width(plan_rows[i], sel ? 2 : 0, 0);
+    }
+}
+
+// Hide the picker. Caller holds the LVGL lock.
+static void plan_hide_locked(void)
+{
+    s_plan_active = false;
+    if (plan_autohide_timer) {
+        lv_timer_del(plan_autohide_timer);
+        plan_autohide_timer = NULL;
+    }
+    if (plan_panel) {
+        lv_obj_add_flag(plan_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// One-shot auto-dismiss. Runs on the LVGL task (timer handler holds the lock),
+// so it hides directly rather than re-locking via ui_plan_hide().
+static void plan_autohide_cb(lv_timer_t *t)
+{
+    (void)t;
+    plan_autohide_timer = NULL;  // repeat_count==1 → LVGL auto-deletes after return
+    plan_hide_locked();
+}
+
+void ui_plan_show(const ui_plan_block_t *blocks, int count)
+{
+    if (blocks == NULL || count <= 0) {
+        return;
+    }
+    if (count > PLAN_MAX_ROWS) {
+        count = PLAN_MAX_ROWS;
+    }
+
+    lvgl_port_lock(0);
+
+    // Lazily build the panel once; reused across shows (orb stays as wallpaper).
+    if (plan_panel == NULL) {
+        plan_panel = lv_obj_create(lv_scr_act());
+        if (plan_panel == NULL) {
+            lvgl_port_unlock();
+            return;
+        }
+        lv_obj_set_size(plan_panel, 320, 300);
+        lv_obj_align(plan_panel, LV_ALIGN_CENTER, 0, 12);
+        lv_obj_set_style_bg_color(plan_panel, lv_color_hex(0x101010), 0);
+        lv_obj_set_style_bg_opa(plan_panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(plan_panel, 16, 0);
+        lv_obj_set_style_pad_all(plan_panel, 8, 0);
+        lv_obj_set_style_border_width(plan_panel, 0, 0);
+        lv_obj_clear_flag(plan_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title = lv_label_create(plan_panel);
+        if (title) {
+            lv_label_set_text(title, "Pick a time (turn + press)");
+            lv_obj_set_style_text_color(title, lv_color_hex(0xBBBBBB), 0);
+            lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+            lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
+        }
+
+        // Fixed-position rows (no flex dependency, no spatial motion).
+        for (int i = 0; i < PLAN_MAX_ROWS; i++) {
+            plan_rows[i] = lv_obj_create(plan_panel);
+            if (plan_rows[i] == NULL) {
+                break;  // heap exhausted — keep the rows we got, NULL-guarded below
+            }
+            lv_obj_set_size(plan_rows[i], 296, 36);
+            lv_obj_align(plan_rows[i], LV_ALIGN_TOP_MID, 0, 34 + i * 40);
+            lv_obj_set_style_radius(plan_rows[i], 8, 0);
+            lv_obj_set_style_pad_left(plan_rows[i], 8, 0);
+            lv_obj_set_style_pad_right(plan_rows[i], 8, 0);
+            lv_obj_set_style_pad_top(plan_rows[i], 0, 0);
+            lv_obj_set_style_pad_bottom(plan_rows[i], 0, 0);
+            lv_obj_set_style_border_color(plan_rows[i], lv_color_hex(0x66FF99), 0);
+            lv_obj_set_style_border_width(plan_rows[i], 0, 0);
+            lv_obj_clear_flag(plan_rows[i], LV_OBJ_FLAG_SCROLLABLE);
+
+            plan_row_labels[i] = lv_label_create(plan_rows[i]);
+            if (plan_row_labels[i]) {
+                lv_label_set_long_mode(plan_row_labels[i], LV_LABEL_LONG_DOT);
+                lv_obj_set_width(plan_row_labels[i], 276);
+                lv_obj_align(plan_row_labels[i], LV_ALIGN_LEFT_MID, 0, 0);
+                lv_obj_set_style_text_color(plan_row_labels[i], lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_style_text_font(plan_row_labels[i], &lv_font_montserrat_14, 0);
+            }
+        }
+    }
+
+    // Populate rows; hide unused. Cap at however many rows actually allocated.
+    plan_count = count;
+    plan_sel = 0;
+    for (int i = 0; i < PLAN_MAX_ROWS; i++) {
+        if (plan_rows[i] == NULL) {
+            if (i < plan_count) plan_count = i;  // ran out of widgets — clamp
+            break;
+        }
+        if (i < count) {
+            const char *id = blocks[i].id ? blocks[i].id : "";
+            strncpy(plan_ids[i], id, sizeof(plan_ids[i]) - 1);
+            plan_ids[i][sizeof(plan_ids[i]) - 1] = '\0';
+
+            const char *lbl = blocks[i].label ? blocks[i].label : "";
+            const char *ttl = blocks[i].title ? blocks[i].title : "";
+            char row[160];
+            snprintf(row, sizeof(row), "%s  %s", lbl, ttl);
+            if (plan_row_labels[i]) {
+                lv_label_set_text(plan_row_labels[i], row);
+            }
+            lv_obj_clear_flag(plan_rows[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(plan_rows[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    if (plan_count <= 0) {
+        // No rows could be created — bail without showing an empty panel.
+        lv_obj_add_flag(plan_panel, LV_OBJ_FLAG_HIDDEN);
+        s_plan_active = false;
+        lvgl_port_unlock();
+        return;
+    }
+
+    plan_restyle_rows_locked();
+    lv_obj_clear_flag(plan_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(plan_panel);
+    s_plan_active = true;
+
+    // Auto-dismiss after 45 s of no interaction.
+    if (plan_autohide_timer) {
+        lv_timer_del(plan_autohide_timer);
+        plan_autohide_timer = NULL;
+    }
+    plan_autohide_timer = lv_timer_create(plan_autohide_cb, 45000, NULL);
+    if (plan_autohide_timer) {
+        lv_timer_set_repeat_count(plan_autohide_timer, 1);
+    }
+
+    lvgl_port_unlock();
+}
+
+void ui_plan_hide(void)
+{
+    lvgl_port_lock(0);
+    plan_hide_locked();
+    lvgl_port_unlock();
+}
+
+bool ui_plan_is_active(void)
+{
+    // Plain read, no lock: called from the volume/button poll paths every few
+    // ms. A benign race (one extra/missed routed rotation across the show/hide
+    // edge) is harmless and not worth contending the LVGL lock for.
+    return s_plan_active;
+}
+
+void ui_plan_move_selection(int delta)
+{
+    lvgl_port_lock(0);
+    if (s_plan_active && plan_count > 0) {
+        plan_sel += (delta > 0) ? 1 : -1;
+        if (plan_sel < 0) plan_sel = plan_count - 1;       // wrap
+        if (plan_sel >= plan_count) plan_sel = 0;
+        plan_restyle_rows_locked();
+        if (plan_autohide_timer) {
+            lv_timer_reset(plan_autohide_timer);  // keep alive while interacting
+        }
+    }
+    lvgl_port_unlock();
+}
+
+const char *ui_plan_get_selected_id(void)
+{
+    static char id[64];
+    id[0] = '\0';
+    lvgl_port_lock(0);
+    if (s_plan_active && plan_sel >= 0 && plan_sel < plan_count) {
+        strncpy(id, plan_ids[plan_sel], sizeof(id) - 1);
+        id[sizeof(id) - 1] = '\0';
+    }
+    lvgl_port_unlock();
+    return id[0] ? id : NULL;
 }

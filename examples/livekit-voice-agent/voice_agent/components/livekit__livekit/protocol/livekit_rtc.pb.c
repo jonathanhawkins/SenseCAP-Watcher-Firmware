@@ -18,27 +18,6 @@ PB_BIND(LIVEKIT_PB_SIMULCAST_CODEC, livekit_pb_simulcast_codec_t, AUTO)
 PB_BIND(LIVEKIT_PB_ADD_TRACK_REQUEST, livekit_pb_add_track_request_t, AUTO)
 
 
-PB_BIND(LIVEKIT_PB_PUBLISH_DATA_TRACK_REQUEST, livekit_pb_publish_data_track_request_t, AUTO)
-
-
-PB_BIND(LIVEKIT_PB_PUBLISH_DATA_TRACK_RESPONSE, livekit_pb_publish_data_track_response_t, AUTO)
-
-
-PB_BIND(LIVEKIT_PB_UNPUBLISH_DATA_TRACK_REQUEST, livekit_pb_unpublish_data_track_request_t, AUTO)
-
-
-PB_BIND(LIVEKIT_PB_UNPUBLISH_DATA_TRACK_RESPONSE, livekit_pb_unpublish_data_track_response_t, AUTO)
-
-
-PB_BIND(LIVEKIT_PB_DATA_TRACK_SUBSCRIBER_HANDLES, livekit_pb_data_track_subscriber_handles_t, AUTO)
-
-
-PB_BIND(LIVEKIT_PB_DATA_TRACK_SUBSCRIBER_HANDLES_PUBLISHED_DATA_TRACK, livekit_pb_data_track_subscriber_handles_published_data_track_t, AUTO)
-
-
-PB_BIND(LIVEKIT_PB_DATA_TRACK_SUBSCRIBER_HANDLES_SUB_HANDLES_ENTRY, livekit_pb_data_track_subscriber_handles_sub_handles_entry_t, AUTO)
-
-
 PB_BIND(LIVEKIT_PB_TRICKLE_REQUEST, livekit_pb_trickle_request_t, AUTO)
 
 
@@ -64,12 +43,6 @@ PB_BIND(LIVEKIT_PB_PARTICIPANT_UPDATE, livekit_pb_participant_update_t, AUTO)
 
 
 PB_BIND(LIVEKIT_PB_UPDATE_SUBSCRIPTION, livekit_pb_update_subscription_t, AUTO)
-
-
-PB_BIND(LIVEKIT_PB_UPDATE_DATA_SUBSCRIPTION, livekit_pb_update_data_subscription_t, AUTO)
-
-
-PB_BIND(LIVEKIT_PB_UPDATE_DATA_SUBSCRIPTION_UPDATE, livekit_pb_update_data_subscription_update_t, AUTO)
 
 
 PB_BIND(LIVEKIT_PB_UPDATE_TRACK_SETTINGS, livekit_pb_update_track_settings_t, AUTO)

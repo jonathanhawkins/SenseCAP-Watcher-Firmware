@@ -23,11 +23,13 @@
 
 static const char *TAG = "main";
 
-#define BUTTON_POLL_MS        25
-#define BUTTON_DEBOUNCE_MS    50
-#define BUTTON_LONG_PRESS_MS  1750   // 1.75 sec hold = disconnect (was 2250, snapped tighter per user feedback)
-#define BUTTON_SLEEP_MS       5000   // 5 sec hold = deep sleep (wake on button)
-#define BUTTON_SHUTDOWN_MS    8000   // 8 sec hold = full shutdown
+#define BUTTON_POLL_MS          25
+#define BUTTON_DEBOUNCE_MS      50
+#define BUTTON_CONNECT_MS       1000   // 1 sec hold = connect/join room (idle home only). A deliberate hold guards against a brush of the knob starting a voice session by accident.
+#define BUTTON_CONNECT_DWELL_MS 600    // how long the green "Release to connect" state stays before the hold UX transitions into the sleep countdown
+#define BUTTON_LONG_PRESS_MS    1750   // 1.75 sec hold = disconnect (in-room only; was 2250, snapped tighter per user feedback)
+#define BUTTON_SLEEP_MS         5000   // 5 sec hold = deep sleep (wake on button)
+#define BUTTON_SHUTDOWN_MS      8000   // 8 sec hold = full shutdown
 
 static void handle_single_click(void)
 {
@@ -120,11 +122,20 @@ static void button_task(void *arg)
     TickType_t last_change = 0;
     TickType_t press_start = 0;
     bool shutdown_triggered = false;
+    // Context for the in-progress hold, latched at press time. Both the hold
+    // UX and the release action key off this rather than re-reading
+    // room_is_active() every tick — otherwise a room dropping mid-hold
+    // (CONNECTED -> DISCONNECTED) would flip the UI from the disconnect flow
+    // to the connect flow on the next poll. Latching freezes the gesture's
+    // meaning for its whole duration.
+    bool hold_in_room = false;
     // Per-press one-shot flags so the threshold-crossed UI callbacks fire
     // exactly once per hold (the loop polls every BUTTON_POLL_MS = 25 ms,
     // so without the flags we'd re-fire on every tick past the threshold).
-    bool disconnect_ready_fired = false;
-    bool sleep_ready_fired = false;
+    bool connect_ready_fired = false;    // idle: crossed BUTTON_CONNECT_MS (green "Release to connect")
+    bool sleep_phase_entered = false;    // idle: hold UX handed off to the sleep countdown
+    bool disconnect_ready_fired = false; // in-room: crossed BUTTON_LONG_PRESS_MS
+    bool sleep_ready_fired = false;      // both: crossed BUTTON_SLEEP_MS
 
     for (;;)
     {
@@ -146,10 +157,16 @@ static void button_task(void *arg)
                 {
                     press_start = now;
                     shutdown_triggered = false;
+                    connect_ready_fired = false;
+                    sleep_phase_entered = false;
                     disconnect_ready_fired = false;
                     sleep_ready_fired = false;
-                    // Immediate visual feedback that the press is registered.
-                    // No-op when not in a voice session.
+                    // Freeze the gesture's context for the whole hold (see the
+                    // hold_in_room comment above).
+                    hold_in_room = room_is_active();
+                    // Immediate visual feedback that the press is registered:
+                    // idle home -> "Hold to connect...", in a room -> "Hold to
+                    // disconnect...".
                     ui_knob_hold_start();
                 }
                 else
@@ -162,80 +179,130 @@ static void button_task(void *arg)
                     // will overwrite this immediately.
                     ui_knob_hold_end();
 
-                    // Skip release handling if shutdown was triggered
+                    // Skip release handling if shutdown already fired mid-hold.
                     if (!shutdown_triggered)
                     {
                         if (held_ms >= BUTTON_SLEEP_MS)
                         {
-                            // 5+ sec hold and release = deep sleep
+                            // 5 s+ -> deep sleep (same gesture in both contexts).
                             handle_deep_sleep();
                         }
-                        else if (held_ms >= BUTTON_LONG_PRESS_MS)
+                        else if (ui_plan_is_active() && held_ms < BUTTON_LONG_PRESS_MS)
                         {
-                            // 2+ sec hold and release = leave room
-                            handle_long_release();
+                            // Plan-of-day picker is showing: a short press confirms
+                            // the knob-highlighted block (the agent books it). A
+                            // longer hold still falls through to disconnect/sleep
+                            // below as an escape hatch.
+                            plan_confirm_selection();
+                        }
+                        else if (hold_in_room)
+                        {
+                            // In a voice room: 1.75 s+ leaves the room. A briefer
+                            // tap is ignored so a stray bump never hangs up a
+                            // live session.
+                            if (held_ms >= BUTTON_LONG_PRESS_MS)
+                            {
+                                handle_long_release();
+                            }
                         }
                         else
                         {
-                            // Quick press = join room
-                            handle_single_click();
+                            // Idle home: 1 s+ joins the room. A tap shorter than
+                            // BUTTON_CONNECT_MS is ignored so a brush of the knob
+                            // never starts a voice session by accident.
+                            if (held_ms >= BUTTON_CONNECT_MS)
+                            {
+                                handle_single_click();
+                            }
                         }
                     }
                 }
             }
         }
 
-        // While held: fire threshold-crossed UI updates so the user knows
-        // what releasing now will do (the actual dispatch still runs on
-        // release, in the branch above).
+        // While held: drive the progress bar + fire the threshold-crossed
+        // hint updates so the user can see what releasing now will do. The
+        // actual dispatch still happens on release (branch above). Context is
+        // the latched hold_in_room, never a fresh room_is_active(), so a
+        // mid-hold room drop can't swap the disconnect flow for the connect
+        // flow.
         if (last_pressed && !shutdown_triggered)
         {
             uint32_t held_ms = (now - press_start) * portTICK_PERIOD_MS;
-            bool room_active = room_is_active();
 
-            // Pick the right denominator for the progress fill:
-            //   - Voice room active: bar fills over BUTTON_LONG_PRESS_MS
-            //     (1.75 s) so it tops out exactly at the disconnect
-            //     threshold. ui_knob_hold_ready_disconnect pins it green;
-            //     ui_knob_hold_ready_sleep then swaps to amber at 5 s.
-            //   - Idle home: there's no disconnect threshold to hit, so
-            //     fill over BUTTON_SLEEP_MS (5 s) — the bar tops out
-            //     exactly when ui_knob_hold_ready_sleep recolors it amber.
-            //
-            // Stop pushing progress values once we've entered a "pinned"
-            // state — disconnect-ready or sleep-ready — so the white fill
-            // writes don't overwrite the green/amber. Note: once
-            // disconnect_ready has fired we stay pinned even if the room
-            // subsequently drops (CONNECTED→DISCONNECTED mid-hold). Without
-            // that, room_active flipping false would un-pin and resume
-            // white progress over the pinned green — a jarring flicker.
-            // (Release still does the right thing: handle_long_release
-            // no-ops when the room has already dropped.)
-            uint32_t progress_window_ms = room_active ? BUTTON_LONG_PRESS_MS : BUTTON_SLEEP_MS;
-            bool progress_pinned = sleep_ready_fired || disconnect_ready_fired;
-            if (!progress_pinned)
+            if (hold_in_room)
             {
-                uint32_t pct = (held_ms * 100U) / progress_window_ms;
-                if (pct > 100) pct = 100;
-                ui_knob_hold_progress((uint8_t)pct);
+                // ===== In a voice room: disconnect (1.75 s) -> sleep (5 s) =====
+                // White fill toward the disconnect threshold; ready_disconnect
+                // pins it green at 1.75 s, ready_sleep swaps it amber at 5 s.
+                // Once either ready-state has fired we stop pushing the white
+                // fill so it can't overwrite the pinned colour.
+                bool progress_pinned = disconnect_ready_fired || sleep_ready_fired;
+                if (!progress_pinned)
+                {
+                    uint32_t pct = (held_ms * 100U) / BUTTON_LONG_PRESS_MS;
+                    if (pct > 100) pct = 100;
+                    ui_knob_hold_progress((uint8_t)pct);
+                }
+                if (!disconnect_ready_fired && held_ms >= BUTTON_LONG_PRESS_MS)
+                {
+                    disconnect_ready_fired = true;
+                    ui_knob_hold_ready_disconnect();
+                }
+                if (!sleep_ready_fired && held_ms >= BUTTON_SLEEP_MS)
+                {
+                    sleep_ready_fired = true;
+                    ui_knob_hold_ready_sleep();
+                }
+            }
+            else
+            {
+                // ===== Idle home: connect (1 s) -> [dwell] -> sleep (5 s) =====
+                // Two-phase fill so the connect gesture and the sleep gesture
+                // each get the full bar and an unmistakable hand-off between
+                // them:
+                //   phase 1  [0, 1 s)              white fill toward connect
+                //   ready    at 1 s                green "Release to connect"
+                //   dwell    [1 s, 1 s+600 ms)     green held so it's legible
+                //   phase 2  [1 s+600 ms, 5 s)     amber refill toward sleep
+                //   ready    at 5 s                amber "Release for sleep"
+                // A release anywhere in [1 s, 5 s) connects; the amber phase-2
+                // copy only signals what holding LONGER will do.
+                const uint32_t sleep_fill_start = BUTTON_CONNECT_MS + BUTTON_CONNECT_DWELL_MS;
+                if (held_ms < BUTTON_CONNECT_MS)
+                {
+                    uint32_t pct = (held_ms * 100U) / BUTTON_CONNECT_MS;
+                    if (pct > 100) pct = 100;
+                    ui_knob_hold_progress((uint8_t)pct);
+                }
+                else if (!connect_ready_fired)
+                {
+                    connect_ready_fired = true;
+                    ui_knob_hold_ready_connect();
+                }
+                else if (held_ms >= sleep_fill_start && !sleep_ready_fired)
+                {
+                    // First tick of phase 2: hand the hold UX off from connect
+                    // to the sleep countdown (resets the bar to empty amber),
+                    // then refill it toward the 5 s sleep threshold.
+                    if (!sleep_phase_entered)
+                    {
+                        sleep_phase_entered = true;
+                        ui_knob_hold_enter_sleep_phase();
+                    }
+                    uint32_t span = BUTTON_SLEEP_MS - sleep_fill_start;
+                    uint32_t pct = ((held_ms - sleep_fill_start) * 100U) / span;
+                    if (pct > 100) pct = 100;
+                    ui_knob_hold_progress((uint8_t)pct);
+                }
+                if (!sleep_ready_fired && held_ms >= BUTTON_SLEEP_MS)
+                {
+                    sleep_ready_fired = true;
+                    ui_knob_hold_ready_sleep();
+                }
             }
 
-            // Only fire the disconnect-ready callback when there's
-            // actually a room to disconnect from. On idle home a release
-            // before 5 s is a no-op (handle_long_release returns early),
-            // so green-amber "Release to disconnect" would be misleading.
-            if (room_active && !disconnect_ready_fired && held_ms >= BUTTON_LONG_PRESS_MS)
-            {
-                disconnect_ready_fired = true;
-                ui_knob_hold_ready_disconnect();
-            }
-            if (!sleep_ready_fired && held_ms >= BUTTON_SLEEP_MS)
-            {
-                sleep_ready_fired = true;
-                ui_knob_hold_ready_sleep();
-            }
-
-            // 8+ seconds = immediate shutdown (emergency power off)
+            // 8 s+ -> immediate emergency power off (fires while still held).
             if (held_ms >= BUTTON_SHUTDOWN_MS)
             {
                 shutdown_triggered = true;
