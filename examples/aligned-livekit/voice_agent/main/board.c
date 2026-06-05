@@ -933,7 +933,17 @@ esp_lcd_touch_handle_t bsp_touch_init(void)
 
     ESP_LOGI(TAG, "Initializing SPD2010 touch IO");
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
-    const esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_SPD2010_CONFIG();
+    esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_SPD2010_CONFIG();
+    // The SPD2010 config macro sets `scl_speed_hz`, but we create this IO on the
+    // LEGACY i2c_lcd driver (an I2C port number cast to a bus handle, below). The
+    // legacy driver REJECTS scl_speed_hz: "scl_speed_hz is not need to set in
+    // legacy i2c_lcd driver" -> esp_lcd_new_panel_io_i2c() returns an error ->
+    // touch_handle stays NULL -> LVGL gets no touch indev -> the ENTIRE
+    // touchscreen is dead (every tap is ignored) while the knob still works.
+    // The bus clock is already configured by bsp_i2c1_bus_init(), so zeroing
+    // this field here is safe and is what the legacy path expects.
+    // (2026-06-05: root cause of "can't tap the wifi button".)
+    tp_io_config.scl_speed_hz = 0;
     if (esp_lcd_new_panel_io_i2c((esp_lcd_i2c_bus_handle_t)BSP_TOUCH_I2C_NUM, &tp_io_config, &tp_io_handle) != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to create touch IO");
