@@ -402,6 +402,112 @@ esp_err_t aligned_get_livekit_credentials(void) {
 }
 
 /**
+ * Dedicated response buffer + event handler for token refresh.
+ *
+ * Kept separate from g_http_response_buffer / aligned_http_event_handler so a
+ * periodic refresh from a background task can never race the connect path's
+ * shared buffer + that handler's static output_len. The refresh response is
+ * tiny ({success, device_id, new_expires_at, message}), so 512 B is ample.
+ */
+#define ALIGNED_REFRESH_BUFFER_SIZE 512
+static char g_refresh_response_buffer[ALIGNED_REFRESH_BUFFER_SIZE] = {0};
+
+static esp_err_t aligned_refresh_http_event_handler(esp_http_client_event_t *evt) {
+    static int rlen = 0;
+
+    switch (evt->event_id) {
+        case HTTP_EVENT_ON_DATA:
+            if (evt->user_data) {
+                int copy_len = evt->data_len;
+                if (rlen + copy_len < (ALIGNED_REFRESH_BUFFER_SIZE - 1)) {
+                    memcpy(((char *)evt->user_data) + rlen, evt->data, copy_len);
+                    rlen += copy_len;
+                    ((char *)evt->user_data)[rlen] = '\0';
+                }
+            }
+            break;
+
+        case HTTP_EVENT_ON_FINISH:
+        case HTTP_EVENT_DISCONNECTED:
+            rlen = 0;
+            break;
+
+        default:
+            break;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t aligned_refresh_token(void) {
+    if (!aligned_has_token()) {
+        ESP_LOGW(TAG, "Token refresh skipped: no device token configured");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    memset(g_refresh_response_buffer, 0, sizeof(g_refresh_response_buffer));
+    char url[512];
+    snprintf(url, sizeof(url), "%s%s", aligned_get_server_url(), ALIGNED_WATCHER_REFRESH);
+
+    cJSON *request = cJSON_CreateObject();
+    cJSON_AddStringToObject(request, "device_token", g_aligned_device_token);
+    char *request_body = cJSON_PrintUnformatted(request);
+    cJSON_Delete(request);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .event_handler = aligned_refresh_http_event_handler,
+        .user_data = g_refresh_response_buffer,
+        .timeout_ms = 10000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, request_body, strlen(request_body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status_code = esp_http_client_get_status_code(client);
+
+    free(request_body);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Token refresh request failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    esp_http_client_cleanup(client);
+
+    if (status_code != 200) {
+        // 401 here means the token already lapsed (the refresh RPC refuses
+        // expired tokens) — the device must be re-provisioned from the
+        // dashboard / serial. Anything else is a transient/server error.
+        ESP_LOGW(TAG, "Token refresh returned HTTP %d: %s", status_code, g_refresh_response_buffer);
+        return ESP_FAIL;
+    }
+
+    cJSON *response = cJSON_Parse(g_refresh_response_buffer);
+    if (response == NULL) {
+        ESP_LOGW(TAG, "Token refresh: failed to parse response");
+        return ESP_FAIL;
+    }
+
+    cJSON *success = cJSON_GetObjectItem(response, "success");
+    if (cJSON_IsTrue(success)) {
+        cJSON *new_expires = cJSON_GetObjectItem(response, "new_expires_at");
+        ESP_LOGI(TAG, "✅ Device token refreshed; new expiry: %s",
+                 (new_expires && cJSON_IsString(new_expires)) ? new_expires->valuestring : "(unknown)");
+        cJSON_Delete(response);
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "Token refresh: backend returned success=false");
+    cJSON_Delete(response);
+    return ESP_FAIL;
+}
+
+/**
  * Get LiveKit URL for WebRTC connection
  */
 const char* aligned_get_livekit_url(void) {

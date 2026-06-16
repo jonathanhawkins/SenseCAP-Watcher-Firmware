@@ -400,6 +400,49 @@ static bool connect_wifi_from_flash(void)
     return false;
 }
 
+// ---- Background device-token auto-refresh -------------------------------
+// The device token expires 90 days after issue (DEFAULT_TOKEN_EXPIRY_DAYS on
+// the backend). This task periodically POSTs /refresh-token so it never lapses
+// during active use. Notes:
+//   * Skips while a voice room is active — a WiFi burst during a call can
+//     starve the audio render thread (see watcher-playback-crackle), so we
+//     defer to a short retry instead.
+//   * The backend's refresh RPC refuses an ALREADY-expired token, so a device
+//     left offline past expiry still needs a one-time re-provision; the failed
+//     refresh just logs and retries.
+//   * vTaskDelay is done in 1-minute chunks: pdMS_TO_TICKS(12h) overflows
+//     TickType_t at the 100 Hz tick rate (43.2M ms * 100 > 2^32).
+#define TOKEN_REFRESH_INITIAL_DELAY_MIN 2     // let WiFi/SNTP settle after boot
+#define TOKEN_REFRESH_INTERVAL_MIN      720   // 12 h — keeps expiry ~90 days out
+#define TOKEN_REFRESH_BUSY_RETRY_MIN    5     // recheck soon if a call was active
+
+static void delay_minutes(int minutes)
+{
+    for (int i = 0; i < minutes; i++) {
+        vTaskDelay(pdMS_TO_TICKS(60 * 1000));
+    }
+}
+
+static void token_refresh_task(void *arg)
+{
+    delay_minutes(TOKEN_REFRESH_INITIAL_DELAY_MIN);
+
+    for (;;) {
+        int wait_min = TOKEN_REFRESH_INTERVAL_MIN;
+
+        if (!aligned_has_token()) {
+            // Nothing to refresh yet (e.g. unprovisioned device); check later.
+        } else if (room_is_active()) {
+            ESP_LOGI(TAG, "Token auto-refresh deferred: voice room active");
+            wait_min = TOKEN_REFRESH_BUSY_RETRY_MIN;
+        } else if (aligned_refresh_token() != ESP_OK) {
+            ESP_LOGW(TAG, "Token auto-refresh failed (will retry next cycle)");
+        }
+
+        delay_minutes(wait_min);
+    }
+}
+
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_INFO);
@@ -495,6 +538,11 @@ void app_main(void)
             ESP_LOGW(TAG, "⚠️  Device token not configured!");
             ESP_LOGI(TAG, "Set token with: aligned_token -t watcher_xxx...");
         }
+
+        // Keep the 90-day device token alive while the device is in use.
+        // No-ops until a token is configured, so it's safe to start here even
+        // on an unprovisioned device. HTTPS handshake needs the larger stack.
+        xTaskCreate(token_refresh_task, "tok_refresh", 8192, NULL, 3, NULL);
     }
     else
     {

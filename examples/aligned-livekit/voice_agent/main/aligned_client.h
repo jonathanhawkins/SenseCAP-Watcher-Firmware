@@ -19,6 +19,7 @@ extern "C" {
 #define ALIGNED_API_BASE_DEFAULT "https://aligned.tools"  // Production server
 #define ALIGNED_WATCHER_CONNECT "/api/py/watcher/connect"
 #define ALIGNED_WATCHER_CLAIM_TOKEN "/api/py/watcher/claim-token"
+#define ALIGNED_WATCHER_REFRESH "/api/py/watcher/refresh-token"
 #define MAX_HTTP_OUTPUT_BUFFER 4096
 
 /**
@@ -71,6 +72,23 @@ bool aligned_poll_for_token(const char *hardware_id);
  * @return ESP_OK on success, ESP_ERR_* on failure
  */
 esp_err_t aligned_get_livekit_credentials(void);
+
+/**
+ * Refresh (extend) the device token's expiration on the backend.
+ *
+ * POSTs to /api/py/watcher/refresh-token with the stored device_token. The
+ * backend extends expires_at (default +90 days) ONLY while the token is still
+ * valid (the refresh RPC refuses already-expired tokens). Call periodically
+ * during active use so the 90-day token never lapses.
+ *
+ * Uses a dedicated response buffer + event handler, so it is safe to call
+ * from a background task concurrently with aligned_get_livekit_credentials().
+ *
+ * @return ESP_OK if the backend confirmed the extension; ESP_ERR_INVALID_STATE
+ *         if no token is configured; ESP_FAIL on HTTP/parse failure (e.g. a
+ *         401 means the token already lapsed and must be re-provisioned).
+ */
+esp_err_t aligned_refresh_token(void);
 
 /**
  * Connect to Aligned backend and fetch LiveKit credentials
