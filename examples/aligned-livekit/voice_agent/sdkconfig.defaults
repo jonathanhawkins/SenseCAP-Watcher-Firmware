@@ -42,6 +42,18 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 # CONFIG_ESP_INT_WDT is not set
 # CONFIG_ESP_TASK_WDT_EN is not set
+# FreeRTOS software-timer (Tmr Svc) daemon stack. The IDF default (2048 B) is
+# too small for the work our timer callbacks legitimately do off that task:
+#   - media.c unmute_timer_cb -> esp_codec_dev_set_in_gain() (codec I2C), armed
+#     on every join_room() via media_set_mic_muted(false). At 2048 B this
+#     overflowed ~300 ms into EVERY voice connect -> "stack overflow in task
+#     Tmr Svc" PANIC -> reboot (the connect never completed). Reproduced + fixed
+#     2026-06-16.
+#   - example.c agent_join_timer_cb / reconnect_timer_cb -> ui_connection_failed()
+#     (LVGL widget work) — same task, also far over 2048 B (latent overflow).
+# 8192 B gives ample headroom for codec I2C + LVGL widget creation from a
+# timer callback (LVGL lv_label_create/style work is itself stack-heavy).
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=8192
 
 # Network Tuning
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
@@ -60,6 +72,17 @@ CONFIG_LV_USE_QRCODE=y
 CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
 CONFIG_MBEDTLS_DTLS_SRTP=y
 CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
+# Allocate ALL mbedTLS memory from PSRAM, not internal SRAM. Measured 2026-06-16:
+# the WebRTC DTLS-SRTP handshake during a voice connect consumed ~98 KB of
+# internal RAM, collapsing it to 6 KB free / 230 B DMA (LCD flush then failed
+# with ESP_ERR_NO_MEM and the session couldn't function) — while 7 MB of PSRAM
+# sat unused. The DTLS handshake buffers are the biggest internal consumer;
+# moving them to PSRAM frees the internal/DMA pool the display + audio need.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# Shrink the per-connection TLS record buffer (default 16384). The /connect
+# JSON and the LiveKit WSS/DTLS records are small; 8 KB is ample and halves
+# the TLS buffer footprint. ASYMMETRIC_CONTENT_LEN keeps the out-buffer small.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
 
 # Disable Data Channel to avoid Atomic Link Error
 CONFIG_ESP_WEBRTC_DATA_CHANNEL=n
