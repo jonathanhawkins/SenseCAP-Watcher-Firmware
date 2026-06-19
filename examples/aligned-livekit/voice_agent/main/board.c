@@ -576,9 +576,29 @@ static esp_codec_dev_handle_t bsp_audio_codec_speaker_init(void)
     const audio_codec_ctrl_if_t *i2c_ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
     assert(i2c_ctrl_if);
 
+    // Speaker route gain. pa_voltage/codec_dac_voltage give the stock
+    // MAX_GAIN = 20*log(5.0/3.3) ≈ 3.6 dB, i.e. at 100% volume the DAC sits at
+    // +3.6 dB (REG32 0xC6) — the modeled PA-no-saturation ceiling. Users found
+    // the device too quiet, so pa_gain intentionally over-drives PAST that
+    // ceiling: hw_gain math is DAC_dB = curve_dB + 3.6 - pa_gain.
+    //   pa_gain -3.0 → +3 dB (REG32 0xCC/204) — verified clean by ear.
+    //   pa_gain -5.0 → +5 dB (REG32 0xD0/208) — verified clean by ear.
+    //   pa_gain -7.0 → +7 dB (REG32 0xD4/212) — current; the empirical edge.
+    // Why the lower steps were bounded-risk: digital gain can't push the Class-D
+    // PA past its 5 V rail, so the failure mode is CLIPPING, not unbounded power,
+    // and clipping is audible (buzz/harsh) BEFORE it's damaging — "back off at the
+    // first distortion" is a safe probe. CAUTION going beyond ~+7 dB: the limiter
+    // shifts from amp clipping (audible) to speaker thermal/excursion (damaging
+    // AND less audible), so "sounds clean" stops being a safety guarantee. The
+    // voice-agent workload (short mid-band bursts, never sustained tones) keeps
+    // thermal load low, which is why this is tolerable. Do NOT push past -7.0
+    // without the real Watcher speaker power rating; the 5.0/3.3 V here are
+    // generic placeholders. If it buzzes/crackles, lower toward 0 (-5.0/-3.0 were
+    // clean). See [[project_watcher_speaker_volume_ceiling]].
     esp_codec_dev_hw_gain_t gain = {
         .pa_voltage = 5.0,
         .codec_dac_voltage = 3.3,
+        .pa_gain = -7.0,
     };
 
     es8311_codec_cfg_t es8311_cfg = {
