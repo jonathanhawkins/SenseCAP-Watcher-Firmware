@@ -869,6 +869,31 @@ static esp_err_t bsp_codec_set_fs(uint32_t rate, uint32_t bits_cfg, i2s_slot_mod
 //   MUST be called BETWEEN media_init() and livekit_room_connect() on reconnect.
 void board_codec_reinit_record(void)
 {
+    // Step 0 — reset the codec data-if channel-enable TRACKING to a clean,
+    // SYNCHRONIZED [in=0, out=0] state BEFORE re-pinning/re-opening.
+    //
+    // ROOT CAUSE of "only works the second time" (verified via I2SDBG, 2026-06-18):
+    // When a connect runs while the codec thinks RX is enabled (in_enable=1 — the
+    // BOOT state, where bsp_audio_init enabled both channels), the codec re-open's
+    // internal TX-disable hits the duplex guard "TX disable should be blocked while
+    // RX runs" (audio_codec_data_i2s.c) and gets DEFERRED (out_disable_pending=1).
+    // That deferral desyncs the channel state (next "RX DIS" returns 0x103
+    // INVALID_STATE) and leaves the SHARED duplex I2S clock not running, so the
+    // first i2s read times out (ret 0x107 → "AUD_SRC -8") — which kills BOTH the
+    // mic (RX) AND the speaker (TX), since they share one clock. The SECOND connect
+    // only works because the failed connect's teardown left in_enable=0, so the
+    // re-open skips the deferral.
+    //
+    // The fix: disable BOTH channels via the IN_OUT path, which goes straight to the
+    // raw i2s_channel_disable for each WITHOUT the per-channel deferral check, and
+    // clears in_enable/out_enable. After this the re-open below ALWAYS starts from
+    // the clean in_enable=0 state — first connect now behaves like the good second
+    // one. Safe here: board_codec_reinit_record runs at JOIN time after the room is
+    // destroyed, so nothing is reading/writing the I2S.
+    if (i2s_data_if != NULL && i2s_data_if->enable != NULL) {
+        i2s_data_if->enable(i2s_data_if, ESP_CODEC_DEV_TYPE_IN_OUT, false);
+    }
+
     // Step 1: re-apply the boot-time RIGHT slot directly at the i2s_std layer.
     if (i2s_rx_chan != NULL) {
         // i2s_channel_reconfig_std_slot() requires the channel be disabled

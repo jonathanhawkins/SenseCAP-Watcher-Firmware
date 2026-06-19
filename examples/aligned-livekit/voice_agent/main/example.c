@@ -590,9 +590,22 @@ static void connect_room_internal(bool meeting)
         // leave_room (close → settle → destroy), so no peer_task references the
         // media — and it cycles the whole duplex I2S cleanly, exactly like a cold
         // boot.
-        ESP_LOGI(TAG, "Reconnect: full media re-init (capturer + renderer) for a clean duplex I2S cycle");
-        media_cleanup();
-        media_init();
+        // ── Option A (init-once / keep-alive) ──────────────────────────────
+        // Do NOT media_cleanup()+media_init() per connect. Tearing down and
+        // rebuilding the shared full-duplex I2S on every connect is what made the
+        // clock-start fragile: on a "dirty" entry state the rebuild leaves the RX
+        // read timing out (i2s ret 0x107 → "AUD_SRC -8"), which kills BOTH the mic
+        // AND the speaker because RX+TX share one I2S clock — the "first connect
+        // doesn't work, reconnect does" bug. The LiveKit engine only start/stops the
+        // DATA flow (esp_capture_start / esp_capture_stop, engine.c:284/304) and
+        // never closes the capturer/renderer, so they are safe to REUSE across
+        // sessions — exactly the boot state the mic reliably works in. This matches
+        // the documented pattern (ESP-ADF keep_pipeline_alive; ESP-IDF requires a
+        // shared duplex TX/RX pair to stay in the SAME start/stop state). We keep
+        // only the mic RIGHT-slot restore below, which the prior session's codec
+        // close can remap to the silent LEFT slot. (2026-06-18, replaces the
+        // per-connect teardown band-aid that this churn used to be.)
+        ESP_LOGI(TAG, "Reconnect: keep media alive (no teardown), restore mic slot only");
         // RIGHT-slot re-pin for the mic. After a disconnect, the LiveKit teardown
         // closed the record codec (input_opened=false), so on reconnect the
         // capturer's channel=1 codec open runs set_fmt and the I2S data-if
