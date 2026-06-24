@@ -26,7 +26,7 @@ extern "C" {
 #ifdef CONFIG_LK_EXAMPLE_SPEAKER_VOLUME
 #define VOLUME_DEFAULT      CONFIG_LK_EXAMPLE_SPEAKER_VOLUME
 #else
-#define VOLUME_DEFAULT      95
+#define VOLUME_DEFAULT      100
 #endif
 
 /**
@@ -36,8 +36,21 @@ extern "C" {
 
 /**
  * @brief Maximum speaker volume
+ *
+ * 100 = the top of esp_codec_dev's default volume curve (0 dB). The board's
+ * hw_gain (pa_voltage 5.0 / codec_dac_voltage 3.3 in board.c → -3.6 dB) then
+ * lands the ES8311 DAC volume register (REG32) at 0xC6/+3.6 dB — the board's
+ * *modeled* PA-saturation ceiling (the loudest the stock curve produces).
+ *
+ * NOTE: this is the safe/clean max, NOT the register max. REG32 goes to
+ * 0xFF/+32 dB, but that range is past PA saturation → clipping + speaker
+ * stress. To get more CLEAN output you'd raise the curve ceiling via
+ * esp_codec_dev_set_vol_curve (each +0.5 dB = +1 register code) and verify
+ * by ear against the real Watcher PA/speaker rating — the 5.0/3.3 V in
+ * board.c are generic placeholders, so the true safe headroom is unknown.
+ * Capping the wheel below 100 just left clean loudness unused.
  */
-#define VOLUME_MAX          95
+#define VOLUME_MAX          100
 
 /**
  * @brief Volume step per encoder tick

@@ -87,6 +87,13 @@ CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
 # Disable Data Channel to avoid Atomic Link Error
 CONFIG_ESP_WEBRTC_DATA_CHANNEL=n
 
+# Boot the speaker at full volume. 100 = top of the stock esp_codec_dev volume
+# curve (DAC ends at +3.6 dB / REG32 0xC6 after board.c hw_gain) — the board's
+# modeled clean ceiling, NOT the codec register max (0xFF/+32 dB, which clips).
+# Lives here (not sdkconfig.watcher, which is inert — the build reads
+# sdkconfig.defaults). Wheel can still trim down at runtime.
+CONFIG_LK_EXAMPLE_SPEAKER_VOLUME=100
+
 # Force Audio Codec to use Legacy I2C Driver (Critical for V10)
 CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=y
 

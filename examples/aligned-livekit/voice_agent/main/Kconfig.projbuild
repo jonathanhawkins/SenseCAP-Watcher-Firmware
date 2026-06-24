@@ -53,7 +53,7 @@ menu "LiveKit Example"
 
     config LK_EXAMPLE_SPEAKER_VOLUME
         int "Default speaker volume (0-100%)"
-        default 85
+        default 100
         range 0 100
         help
             Default playback volume for speaker output.
