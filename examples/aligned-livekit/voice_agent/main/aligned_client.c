@@ -290,12 +290,22 @@ esp_err_t aligned_get_livekit_credentials(void) {
     char *request_body = cJSON_PrintUnformatted(request);
     cJSON_Delete(request);
 
-    // Configure HTTP client
+    // Configure HTTP client. 30s timeout (was 10s): the /connect handler does
+    // token validation + a voice_sessions insert + LiveKit agent dispatch
+    // (up to ~5s) server-side, and on a high-latency uplink (e.g. a phone
+    // hotspot) DNS + TLS + round-trips add several more seconds. 10s reliably
+    // timed out as "Backend unreachable" (ESP_ERR_HTTP_EAGAIN) on slow networks
+    // even though the backend was healthy and responding (verified 2026-06-16:
+    // a same-network curl got a 422 in 6.4s, mostly DNS+TLS). 30s matches the
+    // upstream Cloudflare proxy ceiling, so we wait for the real answer instead
+    // of giving up early. A genuinely unreachable backend still fails fast
+    // (connection refused / DNS), so this only extends the wait when the
+    // backend is slow-but-working — exactly when we want to keep waiting.
     esp_http_client_config_t config = {
         .url = url,
         .event_handler = aligned_http_event_handler,
         .user_data = g_http_response_buffer,
-        .timeout_ms = 10000
+        .timeout_ms = 30000
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -458,7 +468,8 @@ esp_err_t aligned_refresh_token(void) {
         .url = url,
         .event_handler = aligned_refresh_http_event_handler,
         .user_data = g_refresh_response_buffer,
-        .timeout_ms = 10000,
+        // 30s like the /connect path — same backend, same slow-uplink exposure.
+        .timeout_ms = 30000,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -625,12 +636,14 @@ bool aligned_poll_for_token(const char *hardware_id) {
     char *request_body = cJSON_PrintUnformatted(request);
     cJSON_Delete(request);
 
-    // Configure HTTP client
+    // Configure HTTP client. 30s like the /connect path — same backend, same
+    // slow-uplink exposure (this runs during pairing on whatever network the
+    // user is on).
     esp_http_client_config_t config = {
         .url = url,
         .event_handler = aligned_http_event_handler,
         .user_data = g_http_response_buffer,
-        .timeout_ms = 10000
+        .timeout_ms = 30000
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);

@@ -576,9 +576,29 @@ static esp_codec_dev_handle_t bsp_audio_codec_speaker_init(void)
     const audio_codec_ctrl_if_t *i2c_ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
     assert(i2c_ctrl_if);
 
+    // Speaker route gain. pa_voltage/codec_dac_voltage give the stock
+    // MAX_GAIN = 20*log(5.0/3.3) ≈ 3.6 dB, i.e. at 100% volume the DAC sits at
+    // +3.6 dB (REG32 0xC6) — the modeled PA-no-saturation ceiling. Users found
+    // the device too quiet, so pa_gain intentionally over-drives PAST that
+    // ceiling: hw_gain math is DAC_dB = curve_dB + 3.6 - pa_gain.
+    //   pa_gain -3.0 → +3 dB (REG32 0xCC/204) — verified clean by ear.
+    //   pa_gain -5.0 → +5 dB (REG32 0xD0/208) — verified clean by ear.
+    //   pa_gain -7.0 → +7 dB (REG32 0xD4/212) — current; the empirical edge.
+    // Why the lower steps were bounded-risk: digital gain can't push the Class-D
+    // PA past its 5 V rail, so the failure mode is CLIPPING, not unbounded power,
+    // and clipping is audible (buzz/harsh) BEFORE it's damaging — "back off at the
+    // first distortion" is a safe probe. CAUTION going beyond ~+7 dB: the limiter
+    // shifts from amp clipping (audible) to speaker thermal/excursion (damaging
+    // AND less audible), so "sounds clean" stops being a safety guarantee. The
+    // voice-agent workload (short mid-band bursts, never sustained tones) keeps
+    // thermal load low, which is why this is tolerable. Do NOT push past -7.0
+    // without the real Watcher speaker power rating; the 5.0/3.3 V here are
+    // generic placeholders. If it buzzes/crackles, lower toward 0 (-5.0/-3.0 were
+    // clean). See [[project_watcher_speaker_volume_ceiling]].
     esp_codec_dev_hw_gain_t gain = {
         .pa_voltage = 5.0,
         .codec_dac_voltage = 3.3,
+        .pa_gain = -7.0,
     };
 
     es8311_codec_cfg_t es8311_cfg = {
@@ -869,6 +889,31 @@ static esp_err_t bsp_codec_set_fs(uint32_t rate, uint32_t bits_cfg, i2s_slot_mod
 //   MUST be called BETWEEN media_init() and livekit_room_connect() on reconnect.
 void board_codec_reinit_record(void)
 {
+    // Step 0 — reset the codec data-if channel-enable TRACKING to a clean,
+    // SYNCHRONIZED [in=0, out=0] state BEFORE re-pinning/re-opening.
+    //
+    // ROOT CAUSE of "only works the second time" (verified via I2SDBG, 2026-06-18):
+    // When a connect runs while the codec thinks RX is enabled (in_enable=1 — the
+    // BOOT state, where bsp_audio_init enabled both channels), the codec re-open's
+    // internal TX-disable hits the duplex guard "TX disable should be blocked while
+    // RX runs" (audio_codec_data_i2s.c) and gets DEFERRED (out_disable_pending=1).
+    // That deferral desyncs the channel state (next "RX DIS" returns 0x103
+    // INVALID_STATE) and leaves the SHARED duplex I2S clock not running, so the
+    // first i2s read times out (ret 0x107 → "AUD_SRC -8") — which kills BOTH the
+    // mic (RX) AND the speaker (TX), since they share one clock. The SECOND connect
+    // only works because the failed connect's teardown left in_enable=0, so the
+    // re-open skips the deferral.
+    //
+    // The fix: disable BOTH channels via the IN_OUT path, which goes straight to the
+    // raw i2s_channel_disable for each WITHOUT the per-channel deferral check, and
+    // clears in_enable/out_enable. After this the re-open below ALWAYS starts from
+    // the clean in_enable=0 state — first connect now behaves like the good second
+    // one. Safe here: board_codec_reinit_record runs at JOIN time after the room is
+    // destroyed, so nothing is reading/writing the I2S.
+    if (i2s_data_if != NULL && i2s_data_if->enable != NULL) {
+        i2s_data_if->enable(i2s_data_if, ESP_CODEC_DEV_TYPE_IN_OUT, false);
+    }
+
     // Step 1: re-apply the boot-time RIGHT slot directly at the i2s_std layer.
     if (i2s_rx_chan != NULL) {
         // i2s_channel_reconfig_std_slot() requires the channel be disabled

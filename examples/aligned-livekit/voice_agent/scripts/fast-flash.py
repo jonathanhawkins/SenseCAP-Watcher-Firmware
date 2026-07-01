@@ -50,10 +50,15 @@ APP_OFFSET = "0x10000"
 
 
 def autodetect_port() -> str | None:
-    # Watcher exposes the CH343 with two CDC interfaces. Port names look
-    # like /dev/cu.usbmodem56D50186501 (Himax) and ...503 (ESP32-S3).
-    # The interface index is appended as the LAST char (1 vs 3).
-    ports = sorted(glob.glob("/dev/cu.usbmodem*"))
+    # Watcher exposes the CH343 with two CDC interfaces. The ESP32-S3
+    # interface is the one whose name ends in "3" (the Himax MCU ends in "1").
+    # Port name prefix depends on which macOS driver is loaded:
+    #   - Apple's built-in CDC driver -> /dev/cu.usbmodem56D50186503
+    #   - WCH CH34x vendor driver     -> /dev/cu.wchusbserial56D50186503
+    # Match both so autodetect keeps working after the WCH driver install.
+    ports = sorted(
+        glob.glob("/dev/cu.usbmodem*") + glob.glob("/dev/cu.wchusbserial*")
+    )
     esp32_ports = [p for p in ports if p.endswith("3")]
     return esp32_ports[0] if esp32_ports else None
 
