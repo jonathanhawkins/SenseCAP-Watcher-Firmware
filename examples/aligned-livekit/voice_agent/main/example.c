@@ -397,11 +397,11 @@ static void on_data_received(const livekit_data_received_t *data, void *ctx)
             cJSON *adata  = cJSON_GetObjectItem(obj, "artifact_data");
             cJSON *blocks = adata ? cJSON_GetObjectItem(adata, "scheduledBlocks") : NULL;
             if (blocks && cJSON_IsArray(blocks)) {
-                ui_plan_block_t rows[6];
+                ui_plan_block_t rows[UI_PLAN_MAX_BLOCKS];
                 int rc = 0;
                 cJSON *b = NULL;
                 cJSON_ArrayForEach(b, blocks) {
-                    if (rc >= 6) break;
+                    if (rc >= UI_PLAN_MAX_BLOCKS) break;
                     cJSON *jid    = cJSON_GetObjectItem(b, "id");
                     cJSON *jlabel = cJSON_GetObjectItem(b, "startLabel");
                     cJSON *jtitle = cJSON_GetObjectItem(b, "taskSummary");

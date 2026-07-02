@@ -1628,19 +1628,40 @@ void ui_meeting_end(void)
 //=============================================================================
 // Plan-of-the-day picker
 //
-// Knob-selectable list of proposed time blocks, overlaid on the home orb.
+// Knob-selectable list of proposed time blocks, shown as a FULL-SCREEN modal.
 // Driven by the agent's "voice-plan-day" artifact (example.c::on_data_received).
 // Rotation moves the highlight (volume_control.c), a short knob press confirms
 // (main.c button_task -> plan_confirm_selection() in example.c).
 //
+// The panel lives on lv_layer_top() — LVGL's system layer that always renders
+// above every lv_scr_act() widget. This is deliberate: the hint label, status
+// bar and wifi button are constantly re-raised via lv_obj_move_foreground on
+// state changes, so a same-layer panel keeps losing the z-order fight and the
+// underlying UI peeks out around it (real incident 2026-07-01: "Hold knob to
+// disconnect" + mic + wifi visibly cut off behind the picker).
+//
 // watcher-ui.md compliance: overlays via LV_OBJ_FLAG_HIDDEN (never lv_obj_clean
-// — the orb is wallpaper); fixed row layout (no spatially-moving geometry, so
-// no tearing); capped rows + NULL-checked widgets (32 KB LVGL heap); selection
-// is an in-place style change, not a moving cursor.
+// — the orb is wallpaper); rows are fixed geometry and selection scroll uses
+// LV_ANIM_OFF (discrete jumps, no spatially-animated motion, so no tearing);
+// capped rows + NULL-checked widgets (32 KB LVGL heap); selection is an
+// in-place style change, not a moving cursor.
+//
+// Layout inside the 412x412 round panel (center 206, radius 206):
+//   title  TOP_MID y=40                       (chord there fits ~244 px)
+//   list   TOP_MID y=68, 288x280, scrollable  (band corners stay inside r=206)
+//   "n/m"  BOTTOM_MID -44                     (position + "there's more" cue)
+// Rows are 288x50 on a 56 px pitch: 5 full rows visible; the 6th row's top
+// edge peeks in when count > 5, signalling scrollability.
 //=============================================================================
-#define PLAN_MAX_ROWS 6
+#define PLAN_MAX_ROWS   UI_PLAN_MAX_BLOCKS
+#define PLAN_ROW_W      288
+#define PLAN_ROW_H      50
+#define PLAN_ROW_PITCH  56
+#define PLAN_LABEL_H    36   // 2 lines of montserrat_14 (16 px line height) + slack
 
 static lv_obj_t *plan_panel = NULL;
+static lv_obj_t *plan_list = NULL;   // scrollable viewport inside the panel
+static lv_obj_t *plan_pos_label = NULL;  // "2 / 8" position indicator
 static lv_obj_t *plan_rows[PLAN_MAX_ROWS] = {0};
 static lv_obj_t *plan_row_labels[PLAN_MAX_ROWS] = {0};
 static lv_timer_t *plan_autohide_timer = NULL;
@@ -1649,14 +1670,28 @@ static int plan_count = 0;
 static int plan_sel = 0;
 static bool s_plan_active = false;
 
-// Restyle rows so the selected one is highlighted. Caller holds the LVGL lock.
+// Restyle rows so the selected one is highlighted, keep it scrolled into view,
+// and refresh the "n / m" indicator. Caller holds the LVGL lock.
 static void plan_restyle_rows_locked(void)
 {
     for (int i = 0; i < plan_count; i++) {
         if (!plan_rows[i]) continue;
         bool sel = (i == plan_sel);
-        lv_obj_set_style_bg_color(plan_rows[i], sel ? lv_color_hex(0x2E7D32) : lv_color_hex(0x2A2A2A), 0);
+        lv_obj_set_style_bg_color(plan_rows[i], sel ? lv_color_hex(0x2E7D32) : lv_color_hex(0x222831), 0);
         lv_obj_set_style_border_width(plan_rows[i], sel ? 2 : 0, 0);
+    }
+    // Instant (non-animated) scroll — a discrete jump can't tear on the
+    // 40-line partial-buffer pipeline, unlike a smooth scroll animation.
+    if (plan_sel >= 0 && plan_sel < plan_count && plan_rows[plan_sel]) {
+        lv_obj_scroll_to_view(plan_rows[plan_sel], LV_ANIM_OFF);
+    }
+    if (plan_pos_label) {
+        if (plan_count > 1) {
+            lv_label_set_text_fmt(plan_pos_label, "%d / %d", plan_sel + 1, plan_count);
+            lv_obj_clear_flag(plan_pos_label, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(plan_pos_label, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -1695,39 +1730,71 @@ void ui_plan_show(const ui_plan_block_t *blocks, int count)
 
     // Lazily build the panel once; reused across shows (orb stays as wallpaper).
     if (plan_panel == NULL) {
-        plan_panel = lv_obj_create(lv_scr_act());
+        // Full-screen opaque modal on the TOP layer — covers (and stays above)
+        // the hint label, status bar, orb and wifi/mic widgets, which state
+        // changes keep re-raising with lv_obj_move_foreground on lv_scr_act().
+        plan_panel = lv_obj_create(lv_layer_top());
         if (plan_panel == NULL) {
             lvgl_port_unlock();
             return;
         }
-        lv_obj_set_size(plan_panel, 320, 300);
-        lv_obj_align(plan_panel, LV_ALIGN_CENTER, 0, 12);
-        lv_obj_set_style_bg_color(plan_panel, lv_color_hex(0x101010), 0);
+        lv_obj_set_size(plan_panel, 412, 412);
+        lv_obj_align(plan_panel, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(plan_panel, lv_color_hex(0x0E1116), 0);
         lv_obj_set_style_bg_opa(plan_panel, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(plan_panel, 16, 0);
-        lv_obj_set_style_pad_all(plan_panel, 8, 0);
+        lv_obj_set_style_radius(plan_panel, 0, 0);
+        lv_obj_set_style_pad_all(plan_panel, 0, 0);
         lv_obj_set_style_border_width(plan_panel, 0, 0);
         lv_obj_clear_flag(plan_panel, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *title = lv_label_create(plan_panel);
         if (title) {
             lv_label_set_text(title, "Pick a time (turn + press)");
-            lv_obj_set_style_text_color(title, lv_color_hex(0xBBBBBB), 0);
+            lv_obj_set_style_text_color(title, lv_color_hex(0xB9C2CC), 0);
             lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
-            lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
+            lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
         }
 
-        // Fixed-position rows (no flex dependency, no spatial motion).
+        // Scrollable viewport. Sized/positioned so its corners stay inside the
+        // round display (band y=68..348: corner distance <= 202 < r=206).
+        plan_list = lv_obj_create(plan_panel);
+        if (plan_list == NULL) {
+            // Panel without a list is useless — hide it and bail.
+            lv_obj_add_flag(plan_panel, LV_OBJ_FLAG_HIDDEN);
+            lvgl_port_unlock();
+            return;
+        }
+        lv_obj_set_size(plan_list, PLAN_ROW_W, 280);
+        lv_obj_align(plan_list, LV_ALIGN_TOP_MID, 0, 68);
+        lv_obj_set_style_bg_opa(plan_list, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(plan_list, 0, 0);
+        lv_obj_set_style_pad_all(plan_list, 0, 0);
+        lv_obj_set_style_radius(plan_list, 0, 0);
+        lv_obj_set_scrollbar_mode(plan_list, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_scroll_dir(plan_list, LV_DIR_VER);
+
+        // "n / m" position cue — doubles as the "there's more below" signal.
+        plan_pos_label = lv_label_create(plan_panel);
+        if (plan_pos_label) {
+            lv_label_set_text(plan_pos_label, "");
+            lv_obj_set_style_text_color(plan_pos_label, lv_color_hex(0x8A94A0), 0);
+            lv_obj_set_style_text_font(plan_pos_label, &lv_font_montserrat_14, 0);
+            lv_obj_align(plan_pos_label, LV_ALIGN_BOTTOM_MID, 0, -44);
+        }
+
+        // Fixed-pitch rows inside the viewport (no flex dependency, no spatial
+        // motion). LVGL's scroll extent skips HIDDEN children, so spare rows
+        // don't add empty scroll space (verified lv_obj_scroll.c, LVGL 8.4).
         for (int i = 0; i < PLAN_MAX_ROWS; i++) {
-            plan_rows[i] = lv_obj_create(plan_panel);
+            plan_rows[i] = lv_obj_create(plan_list);
             if (plan_rows[i] == NULL) {
                 break;  // heap exhausted — keep the rows we got, NULL-guarded below
             }
-            lv_obj_set_size(plan_rows[i], 296, 36);
-            lv_obj_align(plan_rows[i], LV_ALIGN_TOP_MID, 0, 34 + i * 40);
-            lv_obj_set_style_radius(plan_rows[i], 8, 0);
-            lv_obj_set_style_pad_left(plan_rows[i], 8, 0);
-            lv_obj_set_style_pad_right(plan_rows[i], 8, 0);
+            lv_obj_set_size(plan_rows[i], PLAN_ROW_W, PLAN_ROW_H);
+            lv_obj_set_pos(plan_rows[i], 0, i * PLAN_ROW_PITCH);
+            lv_obj_set_style_radius(plan_rows[i], 10, 0);
+            lv_obj_set_style_pad_left(plan_rows[i], 12, 0);
+            lv_obj_set_style_pad_right(plan_rows[i], 12, 0);
             lv_obj_set_style_pad_top(plan_rows[i], 0, 0);
             lv_obj_set_style_pad_bottom(plan_rows[i], 0, 0);
             lv_obj_set_style_border_color(plan_rows[i], lv_color_hex(0x66FF99), 0);
@@ -1736,8 +1803,12 @@ void ui_plan_show(const ui_plan_block_t *blocks, int count)
 
             plan_row_labels[i] = lv_label_create(plan_rows[i]);
             if (plan_row_labels[i]) {
+                // Fixed W+H + LONG_DOT = hard 2-line clamp with a real "..."
+                // (auto-height labels never dot-truncate; they just keep
+                // wrapping and bleed over the next row — the 2026-07-01 bug).
                 lv_label_set_long_mode(plan_row_labels[i], LV_LABEL_LONG_DOT);
-                lv_obj_set_width(plan_row_labels[i], 276);
+                lv_label_set_recolor(plan_row_labels[i], true);
+                lv_obj_set_size(plan_row_labels[i], PLAN_ROW_W - 24, PLAN_LABEL_H);
                 lv_obj_align(plan_row_labels[i], LV_ALIGN_LEFT_MID, 0, 0);
                 lv_obj_set_style_text_color(plan_row_labels[i], lv_color_hex(0xFFFFFF), 0);
                 lv_obj_set_style_text_font(plan_row_labels[i], &lv_font_montserrat_14, 0);
@@ -1760,8 +1831,22 @@ void ui_plan_show(const ui_plan_block_t *blocks, int count)
 
             const char *lbl = blocks[i].label ? blocks[i].label : "";
             const char *ttl = blocks[i].title ? blocks[i].title : "";
-            char row[160];
-            snprintf(row, sizeof(row), "%s  %s", lbl, ttl);
+            // Titles are user text: escape '#' (LVGL recolor command char) by
+            // doubling it, or a task like "fix #123" would eat the following
+            // word as a color spec. 120 escaped chars > the ~70 that fit in
+            // two lines, so the clamp below still owns truncation.
+            char safe_ttl[120];
+            size_t o = 0;
+            for (const char *p = ttl; *p != '\0' && o < sizeof(safe_ttl) - 2; p++) {
+                if (*p == '#') safe_ttl[o++] = '#';
+                safe_ttl[o++] = *p;
+            }
+            safe_ttl[o] = '\0';
+            // Mint-tinted time prefix via LVGL recolor. The markup sits at the
+            // start of line 1, so LONG_DOT truncation (end of line 2) can never
+            // split the #...# span. (Time labels are server-formatted, never '#'.)
+            char row[176];
+            snprintf(row, sizeof(row), "#A5E8B8 %s#  %s", lbl, safe_ttl);
             if (plan_row_labels[i]) {
                 lv_label_set_text(plan_row_labels[i], row);
             }
@@ -1779,9 +1864,12 @@ void ui_plan_show(const ui_plan_block_t *blocks, int count)
         return;
     }
 
+    if (plan_list) {
+        lv_obj_scroll_to_y(plan_list, 0, LV_ANIM_OFF);  // fresh show starts at the top
+    }
     plan_restyle_rows_locked();
     lv_obj_clear_flag(plan_panel, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(plan_panel);
+    lv_obj_move_foreground(plan_panel);  // within lv_layer_top(), in case anything else lands there
     s_plan_active = true;
 
     // Auto-dismiss after 45 s of no interaction.

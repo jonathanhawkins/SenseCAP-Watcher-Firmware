@@ -175,6 +175,11 @@ void ui_knob_hold_enter_sleep_phase(void);
 // agent books it. See .claude/rules/watcher-voice-flow.md + watcher-ui.md.
 //=============================================================================
 
+/** Max plan blocks the picker renders (shared cap: the artifact parser in
+ *  example.c and the row pool in ui.c). 10 rows ≈ 5-6 KB of the 32 KB LVGL
+ *  heap; the list scrolls (5 visible), so this is a memory cap, not layout. */
+#define UI_PLAN_MAX_BLOCKS 10
+
 /** One selectable proposed time block. Strings are borrowed for the duration
  *  of the ui_plan_show() call only (copied internally as needed). */
 typedef struct {
@@ -184,7 +189,8 @@ typedef struct {
 } ui_plan_block_t;
 
 /** Show/replace the plan picker with @p count blocks (capped internally).
- *  Safe to call from any task (self-locks LVGL). Overlays the orb wallpaper. */
+ *  Safe to call from any task (self-locks LVGL). Full-screen modal on
+ *  lv_layer_top(); scrolls when there are more blocks than fit on screen. */
 void ui_plan_show(const ui_plan_block_t *blocks, int count);
 
 /** Hide the plan picker if showing. Safe from any task; never lv_obj_clean. */
